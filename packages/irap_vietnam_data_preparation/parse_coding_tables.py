@@ -32,7 +32,11 @@ Validation rules (see irap_vietnam_data_preparation/vietnam_data_preparation.md)
     * any required attribute cell is empty (for attributes that have at least
       one non-empty value in the file; attributes with zero non-empty values
       across the whole file are stored as None instead of causing a row drop),
-    * any attribute IRAP code is not in attribute_value_to_irap_number.
+    * any attribute IRAP code is not in attribute_value_to_irap_number,
+    * the optional ``offset_distance_m`` column (distance in meters between the
+      row's FPZ image coordinates and its annotation coordinates) is present,
+      non-blank, and greater than 10.0 (rows whose annotation sits too far from
+      the FPZ point are dropped; the column is ignored when absent or blank).
 - Duplicate segment ids across the entire dataset are resolved by keeping
   the row with the most non-empty attribute cells; warns on every collision.
 """
@@ -68,6 +72,11 @@ REQUIRED_SCALAR_COLUMNS = (
 EXPECTED_LENGTH_KM = 0.02
 LENGTH_TOLERANCE = 1e-6
 INCOMPATIBLE_ATTRIBUTES_FILE = "incompatible_attributes.json"
+# Optional column: distance (m) between a row's FPZ image coordinates and its
+# annotation coordinates. Rows whose annotation is farther than this from the
+# FPZ point are dropped. The column is ignored when absent or blank.
+ANNOT_LOC_OFFSET_COLUMN = "offset_distance_m"
+MAX_ANNOT_LOC_OFFSET_M = 10.0
 
 SEG_ID_RE = re.compile(r"seg\.?\s*no\.?\s*(\d+)", re.IGNORECASE)
 SEG_ID_FALLBACK_RE = re.compile(r"\b(\d{4,})\b")
@@ -372,6 +381,7 @@ class RowDropReason:
     BAD_SEG_ID = "bad_seg_id"
     MISSING_ATTRIBUTE = "missing_attribute"
     UNKNOWN_CODE = "unknown_code"
+    ANNOT_LOC_OFFSET_TOO_FAR = "annot_loc_offset_too_far"
 
 
 def process_file(
@@ -408,6 +418,10 @@ def process_file(
         df, attribute_names, file=path,
         ignored_attributes=ignored_attributes,
     )
+
+    # Optional FPZ-to-annotation offset column (not a required column).
+    norm_to_actual = {normalize_header(c).lower(): c for c in df.columns}
+    annot_loc_offset_col = norm_to_actual.get(ANNOT_LOC_OFFSET_COLUMN.lower())
 
     empty_attrs = [attr for attr in attribute_names
                    if df[cols[attr]].apply(is_blank).all()]
@@ -465,6 +479,13 @@ def process_file(
         # Skip wholly empty rows (XLSX often pads with blanks).
         if all(is_blank(raw[cols[k]]) for k in REQUIRED_SCALAR_COLUMNS):
             continue
+
+        # Drop rows whose annotation sits too far from the FPZ point.
+        if annot_loc_offset_col is not None:
+            annot_loc_offset = parse_float(raw[annot_loc_offset_col])
+            if annot_loc_offset is not None and annot_loc_offset > MAX_ANNOT_LOC_OFFSET_M:
+                drop(RowDropReason.ANNOT_LOC_OFFSET_TOO_FAR)
+                continue
 
         length = parse_float(raw[cols["Length"]])
         if length is None or abs(length - EXPECTED_LENGTH_KM) > LENGTH_TOLERANCE:

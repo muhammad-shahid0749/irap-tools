@@ -10,6 +10,7 @@ RAW_SUBDIR = "_raw"
 WORK_SUBDIR = "_work"
 IMAGES_SUBDIR = "FRAMES"
 IMAGES_DUPLICATES_SUBDIR = "FRAMES_duplicates"
+MISSING_SEGMENTS_TMP_SUBDIR = "missing_segments_tmp"
 
 RARS_SUBDIR_UNDER_RAW = "image_rars"
 ATTR_META_FILENAME = "attribute_metadata.json"
@@ -36,6 +37,10 @@ def images_dir(data_dir: Path) -> Path:
 
 def images_duplicates_dir(data_dir: Path) -> Path:
     return work_dir(data_dir) / IMAGES_DUPLICATES_SUBDIR
+
+
+def missing_segments_tmp_dir(data_dir: Path) -> Path:
+    return work_dir(data_dir) / MISSING_SEGMENTS_TMP_SUBDIR
 
 
 def metadata_dir(data_dir: Path) -> Path:

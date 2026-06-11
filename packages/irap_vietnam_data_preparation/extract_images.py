@@ -10,6 +10,11 @@ By default the script aborts on any such duplicate path; pass
 silently kept (first archive wins), while duplicates with differing content
 trigger a warning.
 
+Archives whose name contains ``missing_segments`` hold corrected segment
+images; they are applied after the regular archives, unconditionally replacing
+same-named files, and do not participate in the duplicate check (see
+:func:`_apply_missing_segments`).
+
 The images output directory is wiped before extraction so that no stale or
 partially-written files from a previous run survive. The script prompts for
 confirmation when the directory is non-empty; pass ``--yes`` to skip the
@@ -29,6 +34,7 @@ import shutil
 import subprocess
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -39,10 +45,30 @@ import layout
 
 SPLIT_WRAPPER_RE = re.compile(r"^split\d+/", re.IGNORECASE)
 
+# Captures the video_dir prefix of a "<video_dir>_segN.png" filename.
+SEG_VIDEO_DIR_RE = re.compile(r"^(.*)_seg\d+\.png$", re.IGNORECASE)
+
 
 def strip_split_wrapper(internal_path: str) -> str:
     """Strip a single leading ``splitN/`` component from an archive entry path."""
     return SPLIT_WRAPPER_RE.sub("", internal_path, count=1)
+
+
+def video_dir_from_filename(filename: str) -> str | None:
+    """Return the owning ``<video_dir>`` for a ``<video_dir>_segN.png`` file.
+
+    Segment files are named ``<video_dir>_seg<N>.png``, so the video folder a
+    file belongs in is recoverable from the filename alone – independent of how
+    deeply the file was wrapped inside its source archive. Returns ``None`` when
+    the name does not match the convention.
+    """
+    m = SEG_VIDEO_DIR_RE.match(filename)
+    return m.group(1) if m else None
+
+
+def is_missing_segments(archive: Path) -> bool:
+    """True for archives holding corrected segments that replace regular files."""
+    return "missing_segments" in archive.name.lower()
 
 
 def find_extractor() -> tuple[str, str]:
@@ -344,6 +370,93 @@ def extract_duplicates(
         _flatten_split_wrappers(archive_dup_out)
 
 
+def _extract_parallel(
+        binary: str, kind: str, archives: list[Path],
+        archive_entries: dict[Path, list[tuple[str, int, str | None]]],
+        dest_for: Callable[[Path], Path], *, jobs: int | None, label: str,
+) -> None:
+    """Extract *archives* concurrently, each into ``dest_for(archive)``."""
+    num_jobs = jobs or min(len(archives), 4)
+    print(f"\nExtracting {len(archives)} {label} archive(s) with "
+          f"{num_jobs} parallel worker(s)...")
+    with ThreadPoolExecutor(max_workers=num_jobs) as ex:
+        futures = {
+            ex.submit(extract, binary, kind, a, dest_for(a),
+                      num_entries=len(archive_entries[a]),
+                      position=i): a
+            for i, a in enumerate(archives)
+        }
+        for fut in as_completed(futures):
+            fut.result()
+
+
+def _apply_missing_segments(
+        binary: str, kind: str, archives: list[Path], out: Path, tmp: Path,
+        *, jobs: int | None,
+) -> None:
+    """Extract missing_segments *archives* and merge their files into ``out``.
+
+    Each archive is extracted into its own fresh subdirectory of the scratch
+    directory ``tmp`` (fresh, so the extractor's skip-if-exists mode never
+    triggers and concurrent extractions cannot race). Every
+    ``<video_dir>_segN.png`` file is then moved to ``out/<video_dir>/<file>``,
+    unconditionally replacing what the regular archives produced; the owning
+    ``<video_dir>`` is recovered from the filename because the missing_segments
+    archives wrap the video folders in arbitrary (sometimes nested) folders, so
+    the extracted directory structure cannot be trusted the way the regular
+    ``splitN/`` archives' can. Files not matching the naming convention are
+    reported and skipped. Archive subdirectories are merged in sorted order, so
+    on conflicts between missing_segments archives the lexicographically last
+    archive wins, deterministically.
+    """
+    print(f"\nIndexing {len(archives)} missing_segments archive(s)...")
+    entries: dict[Path, list[tuple[str, int, str | None]]] = {}
+    for a in archives:
+        entries[a] = list_entries(binary, kind, a)
+        print(f"  {a.name}: {len(entries[a])} entries")
+
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    try:
+        _extract_parallel(binary, kind, archives, entries,
+                          lambda a: tmp / a.stem, jobs=jobs,
+                          label="missing_segments")
+
+        print("Merging missing_segments files into the images directory...")
+        replaced = 0   # overwrote a file the regular archives produced
+        added = 0      # brand-new file
+        unmatched: list[Path] = []
+        for sub in sorted(tmp.iterdir()):
+            for src_file in sub.rglob("*"):
+                if not src_file.is_file():
+                    continue
+                video_dir = video_dir_from_filename(src_file.name)
+                if video_dir is None:
+                    unmatched.append(src_file)
+                    continue
+                dst_file = out / video_dir / src_file.name
+                dst_file.parent.mkdir(parents=True, exist_ok=True)
+                if dst_file.exists():
+                    replaced += 1
+                else:
+                    added += 1
+                src_file.replace(dst_file)
+
+        if unmatched:
+            print(f"WARN: {len(unmatched)} missing_segments file(s) did not match "
+                  f"the <video_dir>_segN.png naming convention and were skipped:",
+                  file=sys.stderr)
+            for p in unmatched[:20]:
+                print(f"    {p.relative_to(tmp)}", file=sys.stderr)
+            if len(unmatched) > 20:
+                print(f"    ... and {len(unmatched) - 20} more", file=sys.stderr)
+
+        print(f"  {replaced + added} file(s) merged: {replaced} replaced "
+              f"existing, {added} newly added.")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("data_dir", type=Path,
@@ -356,75 +469,79 @@ def main(argv: list[str] | None = None) -> int:
                              "non-empty images directory.")
     parser.add_argument("--jobs", "-j", type=int, default=None,
                         help="Parallel extractions. Default: "
-                             "min(num_archives, max(4, cpu_count()//4)).")
+                             "min(num_archives, 4).")
     args = parser.parse_args(argv)
 
     rars = layout.rars_dir(args.data_dir)
     out = layout.images_dir(args.data_dir)
-    archives = sorted(rars.glob("*.rar")) if rars.is_dir() else []
-    if not archives:
+    all_archives = sorted(rars.glob("*.rar")) if rars.is_dir() else []
+    if not all_archives:
         print(f"No .rar archives found in {rars}", file=sys.stderr)
         return 1
 
+    regular_archives = [a for a in all_archives if not is_missing_segments(a)]
+    missing_archives = [a for a in all_archives if is_missing_segments(a)]
+
     binary, kind = find_extractor()
     print(f"Using extractor: {binary} ({kind})")
-    print(f"Found {len(archives)} archive(s):")
-    for a in archives:
-        print(f"  {a.name}  ({a.stat().st_size / 1e9:.2f} GB)")
+    print(f"Found {len(all_archives)} archive(s):")
+    if regular_archives:
+        print(f"  Regular archives ({len(regular_archives)}):")
+        for a in regular_archives:
+            print(f"    {a.name}  ({a.stat().st_size / 1e9:.2f} GB)")
+    if missing_archives:
+        print(f"  Missing segments archives ({len(missing_archives)}):")
+        for a in missing_archives:
+            print(f"    {a.name}  ({a.stat().st_size / 1e9:.2f} GB)")
 
-    print(f"Indexing {len(archives)} archive(s)...")
+    print(f"Indexing {len(regular_archives)} regular archive(s)...")
     archive_entries: dict[Path, list[tuple[str, int, str | None]]] = {}
-    for a in archives:
+    for a in regular_archives:
         archive_entries[a] = list_entries(binary, kind, a)
         print(f"  {a.name}: {len(archive_entries[a])} entries")
 
     dup_out = layout.images_duplicates_dir(args.data_dir)
 
-    print("Checking for duplicate basenames across archives...")
-    by_name, collisions, total = _compute_collisions(archive_entries)
-    num_files = len(by_name)
-    print(f"  {num_files} unique basenames, {total / 1e9:.2f} GB total "
-          f"(uncompressed)")
+    if archive_entries:
+        print("Checking for duplicate basenames across regular archives...")
+        by_name, collisions, total = _compute_collisions(archive_entries)
+        print(f"  {len(by_name)} unique basenames, {total / 1e9:.2f} GB total "
+              f"(uncompressed)")
 
-    if collisions:
-        if dup_out.exists():
-            shutil.rmtree(dup_out)
-        dup_out.mkdir(parents=True, exist_ok=True)
-        print(f"Extracting {len(collisions)} duplicate path(s) to {dup_out}...")
-        extract_duplicates(binary, kind, archive_entries, collisions, dup_out)
-        dup_count = sum(1 for p in dup_out.rglob("*") if p.is_file())
-        print(f"  {dup_count} file(s) written to {dup_out}")
-        _report_collisions(collisions, ignore_duplicates=args.ignore_duplicates)
+        if collisions:
+            if dup_out.exists():
+                shutil.rmtree(dup_out)
+            dup_out.mkdir(parents=True, exist_ok=True)
+            print(f"Extracting {len(collisions)} duplicate path(s) to {dup_out}...")
+            extract_duplicates(binary, kind, archive_entries, collisions, dup_out)
+            dup_count = sum(1 for p in dup_out.rglob("*") if p.is_file())
+            print(f"  {dup_count} file(s) written to {dup_out}")
+            _report_collisions(collisions, ignore_duplicates=args.ignore_duplicates)
 
-    if out.exists() and any(out.iterdir()):
-        if not args.yes:
-            print(f"\n{out} is non-empty and will be wiped before extraction.")
-            reply = input("Proceed? [y/N] ").strip().lower()
-            if reply not in ("y", "yes"):
-                print("Aborted.", file=sys.stderr)
-                return 1
-        print(f"Wiping {out}...")
-        shutil.rmtree(out)
-    out.mkdir(parents=True, exist_ok=True)
+    if regular_archives:
+        if out.exists() and any(out.iterdir()):
+            if not args.yes:
+                print(f"\n{out} is non-empty and will be wiped before extraction.")
+                reply = input("Proceed? [y/N] ").strip().lower()
+                if reply not in ("y", "yes"):
+                    print("Aborted.", file=sys.stderr)
+                    return 1
+            print(f"Wiping {out}...")
+            shutil.rmtree(out)
+        out.mkdir(parents=True, exist_ok=True)
 
-    num_jobs = args.jobs or min(len(archives), 4)
-    print(f"Extracting {len(archives)} archive(s) with {num_jobs} "
-          f"parallel worker(s)...")
+        _extract_parallel(binary, kind, regular_archives, archive_entries,
+                          lambda _a: out, jobs=args.jobs, label="regular")
 
-    with ThreadPoolExecutor(max_workers=num_jobs) as ex:
-        futures = {
-            ex.submit(extract, binary, kind, a, out,
-                      num_entries=len(archive_entries[a]),
-                      position=i): a
-            for i, a in enumerate(archives)
-        }
-        for fut in as_completed(futures):
-            fut.result()
+        print("Flattening splitN/ wrappers...")
+        _flatten_split_wrappers(out)
 
-    print("Flattening splitN/ wrappers...")
-    _flatten_split_wrappers(out)
+    if missing_archives:
+        _apply_missing_segments(binary, kind, missing_archives, out,
+                                layout.missing_segments_tmp_dir(args.data_dir),
+                                jobs=args.jobs)
 
-    print(f"\nDone. {sum(1 for _ in out.iterdir())} files in {out}")
+    print(f"\nDone. {sum(1 for p in out.rglob('*') if p.is_file())} file(s) in {out}")
     return 0
 
 
