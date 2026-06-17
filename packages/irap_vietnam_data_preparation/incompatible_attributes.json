@@ -28,5 +28,20 @@
     "Pedestrian observed flow along the road driver-side",
     "Pedestrian observed flow along the road passenger-side",
     "Pedestrian fencing"
-  ]
+  ],
+  "_comment_bh_to_table_attribute_name": "Maps a BiH attribute_metadata.json attribute name to the (differently spelled) header used for it in the Vietnam coding tables. Used to resolve required columns whose Vietnam header does not match the BiH name even after case-insensitive comparison. Output keeps the canonical BiH name.",
+  "bh_to_table_attribute_name": {
+    "Carriageway label": "Carriageway",
+    "Roadside severity - driver-side distance": "Roadside severity - drivers side distance",
+    "Roadside severity - driver-side object": "Roadside severity - drivers side object",
+    "Roadside severity - passenger-side distance": "Roadside severity - passenger side distance",
+    "Roadside severity - passenger-side object": "Roadside severity - passenger side object",
+    "Paved shoulder - driver-side": "Paved shoulder - drivers side",
+    "Paved shoulder - passenger-side": "Paved shoulder - passenger side",
+    "Land use - driver-side": "Land use - drivers side",
+    "Land use - passenger-side": "Land use - passenger side",
+    "Pedestrian crossing - side road": "Pedestrian crossing facilities - side road",
+    "Sidewalk - driver-side": "Sidewalk - drivers side",
+    "Sidewalk - passanger-side": "Sidewalk - passenger side"
+  }
 }

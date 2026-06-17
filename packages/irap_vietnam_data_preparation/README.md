@@ -89,11 +89,18 @@ python parse_coding_tables.py $DATA_DIR
 
 Auto-unzips `_raw/coding-tables.zip` if needed. Validates required column names
 against `_raw/attribute_metadata.json` (errors on missing columns). Drops rows
-with `Length != 0.02 km`, missing scalar/attribute fields, unparseable
-`Image Reference FPZ`, unknown IRAP codes, or – when the optional
-`offset_distance_m` column is present – an FPZ-to-annotation distance greater
-than 10 m. Resolves duplicate `seg_id`s across files by keeping the row with
-the most non-empty attribute cells.
+with `Length != 0.02 km`, missing scalar fields, unparseable
+`Image Reference FPZ`, no genuine attribute value at all (non-coding/padding
+rows), unknown IRAP codes, or, when the optional `offset_distance_m` column is
+present – an FPZ-to-annotation distance greater than 8 m. Resolves duplicate
+`seg_id`s across files by keeping the row with the most genuinely-coded
+attribute cells, warning when the duplicates' attribute values disagree.
+
+Rows with *some* (but not all) attribute cells blank are **kept** by default,
+with the missing cells set to `-1` (`MISSING_ATTR_CODE`, analogous to an ignore
+label). The `parse_report.json` and stdout summary record which attributes are
+missing in how many kept rows, per file and overall. Pass
+`--drop-rows-missing-attributes` to drop any row with a blank attribute cell.
 
 ### Stage 3b – Build BiH-compatible metadata
 
