@@ -27,7 +27,7 @@ the dataset root – and derives all subpaths internally.
     parse_report.json
     build_report.json
   
-  images/                        # Stage 2 output (nested by video sequence)
+  FRAMES/                        # Stage 2 output (nested by video sequence)
     <video_dir>/
       <video_dir>_seg<N>.png
   segment_id_to_data_paths_rel.json  # Stage 3b outputs (directly in root)
@@ -48,15 +48,6 @@ attribute codes to 20-m road segments. Before running anything, populate
 `$VIDLU_DATASETS`, `$VIDLU_DATA/datasets`, then ancestors of the package for
 `data/datasets/IRAP_Vietnam`.
 
-## End-to-end
-
-```bash
-bash prepare_dataset.sh <data_dir>
-```
-
-Skips downloading or extraction with `--skip-download` / `--skip-extract` if
-already done. See `prepare_dataset.sh --help` for split-ratio / seed options.
-
 ## Per-stage commands
 
 Set `DATA_DIR=/path/to/IRAP_Vietnam`.
@@ -72,7 +63,7 @@ Files are resumable (HTTP Range). Existing files with matching size are skipped.
 ### Stage 2 – Extract images grouped by source video
 
 ```bash
-python extract_images.py $DATA_DIR
+python extract_images.py $DATA_DIR --ignore-duplicates
 ```
 
 - Extracts with `unrar x` / `7z x`. The outer `splitN/` wrapper is stripped, leaving `images/<video_dir>/<video_dir>_seg<N>.png`.
@@ -125,15 +116,6 @@ Both tools write `splits.json` as `{<split_name>: [seg_id, ...]}` with segment i
 - `unlabeled_train`, `unlabeled_val`, `unlabeled_test` – unlabeled segments assigned the same way. Omitted if `unlabeled_sequence_id_to_data.json` is not present in the metadata directory.
 - `unlabeled_unlocated` – unlabeled segments from image folders that have no labeled siblings, so no map coordinate is derivable. Auto-populated from `unlabeled_unlocated_segment_ids.json` and not user-editable in the map GUI. Omitted if the file is absent.
 
-#### Automatic (K-Means)
-
-```bash
-python make_splits.py $DATA_DIR
-```
-
-Per-section deterministic allocation: whole sections go into one split,
-giving geographically non-overlapping splits with no leakage.
-
 #### Manual (map GUI)
 
 ```bash
@@ -151,6 +133,17 @@ Opens a browser-based map showing all road sections as coloured polylines.
 If `splits.json` already exists in the metadata directory it is used as the
 starting assignment (useful for tweaking an automatic result).
 Requires `streamlit >= 1.35`.
+
+#### Automatic (K-Means)
+
+Note: This procedure is experimental and not recommended. The code is AI-generated and not reviewed.
+
+```bash
+python make_splits.py $DATA_DIR
+```
+
+Per-section deterministic allocation: whole sections go into one split,
+giving geographically non-overlapping splits with no leakage.
 
 ## Stage 4 – clean up
 

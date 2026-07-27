@@ -490,7 +490,7 @@ def main(argv: list[str] | None = None) -> int:
         for a in regular_archives:
             print(f"    {a.name}  ({a.stat().st_size / 1e9:.2f} GB)")
     if missing_archives:
-        print(f"  Missing segments archives ({len(missing_archives)}):")
+        print(f"  Missing-segments archives ({len(missing_archives)}):")
         for a in missing_archives:
             print(f"    {a.name}  ({a.stat().st_size / 1e9:.2f} GB)")
 

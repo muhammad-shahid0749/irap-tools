@@ -53,6 +53,7 @@ import difflib
 import json
 import math
 import re
+import shutil
 import sys
 import zipfile
 from collections import Counter, defaultdict
@@ -92,21 +93,22 @@ SEG_ID_RE = re.compile(r"seg\.?\s*no\.?\s*(\d+)", re.IGNORECASE)
 SEG_ID_FALLBACK_RE = re.compile(r"\b(\d{4,})\b")
 
 
-def resolve_coding_tables_dir(in_dir: Path) -> Path:
+def resolve_coding_tables_dir(zip_dir: Path, out_dir: Path) -> Path:
     """Return a directory containing the coding tables.
 
-    If ``coding-tables/`` exists, use it. Otherwise unzip
-    ``coding-tables.zip`` into a sibling ``coding-tables/`` and return that.
+    Always removes any existing ``coding-tables/`` directory under ``out_dir``
+    and re-extracts ``coding-tables.zip`` (read from ``zip_dir``) into a fresh
+    ``coding-tables/``, then returns it.
     """
-    unzipped = in_dir / "coding-tables"
-    if unzipped.is_dir():
-        return unzipped
-    zip_path = in_dir / "coding-tables.zip"
+    unzipped = out_dir / "coding-tables"
+    zip_path = zip_dir / "coding-tables.zip"
     if not zip_path.is_file():
         raise FileNotFoundError(
-            f"Neither '{unzipped}' nor '{zip_path}' found. Expected coding "
-            f"tables in --in."
+            f"'{zip_path}' not found. Expected coding tables in --in."
         )
+    if unzipped.is_dir():
+        print(f"Removing existing {unzipped}...")
+        shutil.rmtree(unzipped)
     print(f"Unzipping {zip_path} -> {unzipped}...")
     unzipped.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(zip_path) as zf:
@@ -191,6 +193,26 @@ def is_blank(value: T.Any) -> bool:
     if isinstance(value, str) and value.strip() == "":
         return True
     return False
+
+
+def format_row_ranges(rows: T.Iterable[int]) -> str:
+    """Collapse a set of 1-based row numbers into a list of continuous ranges.
+
+    E.g. ``[92, 93, 468, 469, 470]`` -> ``"92-93, 468-470"``.
+    """
+    nums = sorted(set(rows))
+    if not nums:
+        return ""
+    ranges: list[tuple[int, int]] = []
+    start = prev = nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+        else:
+            ranges.append((start, prev))
+            start = prev = n
+    ranges.append((start, prev))
+    return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in ranges)
 
 
 def parse_seg_id(cell: T.Any) -> int | None:
@@ -283,14 +305,14 @@ def read_sheet(path: Path) -> pd.DataFrame:
     """
     engine = "xlrd" if path.suffix.lower() == ".xls" else "openpyxl"
     sheets = pd.read_excel(path, sheet_name=None, engine=engine, dtype=object)
-    non_empty = {n: df for n, df in sheets.items() if not df.empty}
-    if not non_empty:
+    non_empty_sheets = {n: df for n, df in sheets.items() if not df.empty}
+    if not non_empty_sheets:
         return pd.DataFrame()
-    if len(non_empty) > 1:
+    if len(non_empty_sheets) > 1:
         print(
-            f"WARN: {path}: expected 1 sheet, found {len(non_empty)}: {list(non_empty)}"
+            f"WARN: {path}: parsed first of {len(non_empty_sheets)} sheets: {list(non_empty_sheets)}"
         )
-    return next(iter(non_empty.values()))
+    return next(iter(non_empty_sheets.values()))
 
 
 def file_is_coding_table(
@@ -397,7 +419,7 @@ def validate_columns(
             actual_col = actual[h]
             num_vals = sum(1 for v in df[actual_col] if not is_blank(v))
             print(
-                f"WARN: {file.name}: ignoring '{attr}' "
+                f"WARN: {file.name}: ignoring (as per configuration) column '{attr}' "
                 f"({num_vals} non-empty value(s))",
                 file=sys.stderr,
             )
@@ -533,6 +555,10 @@ def process_file(
     # per attribute. Counted over kept rows only, so each per-attribute total is
     # consistent with rows_with_missing (always <= rows_with_missing).
     missing_attr_row_indices: dict[str, list[int]] = defaultdict(list)
+    # 1-based row numbers grouped by the exact set (tuple) of missing
+    # attributes, so identical missing-attribute warnings are emitted once as
+    # continuous row ranges instead of one line per row.
+    missing_attrs_rows: dict[tuple[str, ...], list[int]] = defaultdict(list)
 
     def drop(reason: str) -> None:
         drop_counts[reason] += 1
@@ -582,11 +608,7 @@ def process_file(
             continue
         missing_attrs_row = [a for a, v in attrs.items() if v == MISSING_ATTR_CODE and a not in per_file_skip]
         if missing_attrs_row:
-            print(
-                f"INFO: {path.name}: row {idx + 1}: missing value for attribute(s) "
-                f"{', '.join(missing_attrs_row)}",
-                file=sys.stderr,
-            )
+            missing_attrs_rows[tuple(missing_attrs_row)].append(idx + 1)
 
         # A row with no genuine attribute value (all blank / file-level-empty)
         # is a non-coding / padding row carrying no labeling signal; drop it
@@ -616,13 +638,22 @@ def process_file(
                 missing_attr_row_indices[a].append(idx)
         rows.append(rec)
 
+    # Emit one warning per distinct set of missing attributes, collapsing the
+    # affected rows into continuous ranges.
+    for attrs_tuple, row_nums in missing_attrs_rows.items():
+        print(
+            f"WARN: {path.name}: missing value for attribute(s) {', '.join(attrs_tuple)}"
+            f" in rows: {format_row_ranges(row_nums)}",
+            file=sys.stderr,
+        )
+
     if drop_counts_per_file is not None and file_drops:
         drop_counts_per_file[path.name] = file_drops
     if rows_with_missing_attrs_per_file is not None and rows_with_missing:
         rows_with_missing_attrs_per_file[path.name] = rows_with_missing
 
     # Per-attribute missing counts over kept rows (consistent with the totals
-    # above). Warn per attribute, sampling a few source row indices.
+    # above). Warn per attribute, collapsing source row indices into ranges.
     if missing_attr_row_indices:
         num_kept = len(rows)
         missing_per_attr: dict[str, int] = {}
@@ -631,9 +662,7 @@ def process_file(
             if not idxs:
                 continue
             missing_per_attr[attr] = len(idxs)
-            indices_str = ", ".join(str(int(i) + 1) for i in idxs[:5])
-            if len(idxs) > 5:
-                indices_str += ", ..."
+            indices_str = format_row_ranges(int(i) + 1 for i in idxs)
             print(
                 f"WARN: {path.name}: attribute '{attr}' set to "
                 f"{MISSING_ATTR_CODE} in {len(idxs)}/{num_kept} kept row(s) "
@@ -688,6 +717,11 @@ def resolve_duplicates(
 
     kept: list[dict] = []
     dropped: list[dict] = []
+    # Collect the per-collision warnings and collapse seg_ids that share an
+    # identical message (same source files, winner and reason) into row ranges,
+    # mirroring the missing-attribute reporting. Insertion order is preserved.
+    dup_warnings: dict[tuple[tuple[str, ...], str, str], list[int]] = defaultdict(list)
+    conflict_warnings: dict[str, list[int]] = defaultdict(list)
     for seg_id, group in by_seg.items():
         if len(group) == 1:
             kept.append(group[0])
@@ -702,16 +736,28 @@ def resolve_duplicates(
         kept.append(winner)
         for _, r in scored[1:]:
             dropped.append(r)
-        files = [r["source_file"] for r in group]
-        print(f"WARN: duplicate seg_id {seg_id} across {files}; "
-              f"kept row from {winner['source_file']}", file=sys.stderr)
+        winner_filled = num_filled_attribute_cells(winner, attribute_names)
+        runner_up_filled = num_filled_attribute_cells(scored[1][1], attribute_names)
+        if winner_filled > runner_up_filled:
+            reason = f"most filled cells ({winner_filled} vs {runner_up_filled})"
+        else:
+            reason = f"first occurrence (tie at {winner_filled} filled cells)"
+        files = tuple(r["source_file"] for r in group)
+        dup_warnings[(files, winner["source_file"], reason)].append(int(seg_id))
         conflicts = conflicting_attributes(group, attribute_names)
         if conflicts:
             details = "; ".join(
                 f"{attr}={sorted(vals)}" for attr, vals in sorted(conflicts.items())
             )
-            print(f"WARN: duplicate seg_id {seg_id} has conflicting attribute "
-                  f"value(s): {details}", file=sys.stderr)
+            conflict_warnings[details].append(int(seg_id))
+
+    for (files, winner_file, reason), seg_ids in dup_warnings.items():
+        print(f"WARN: duplicate seg_id(s) {format_row_ranges(seg_ids)} "
+              f"across {list(files)}; kept row from {winner_file} ({reason})",
+              file=sys.stderr)
+    for details, seg_ids in conflict_warnings.items():
+        print(f"WARN: duplicate seg_id(s) {format_row_ranges(seg_ids)} "
+              f"with conflicting attribute value(s): {details}", file=sys.stderr)
     return kept, dropped
 
 
@@ -722,6 +768,7 @@ def resolve_duplicates(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+
     parser.add_argument("data_dir", type=Path,
                         help="IRAP_Vietnam dataset root.")
     parser.add_argument(
@@ -759,7 +806,7 @@ def main(argv: list[str] | None = None) -> int:
     if name_mapping:
         print(f"Translating {len(name_mapping)} attribute name(s) to their "
               f"Vietnam table header per mapping file.")
-    coding_tables_dir = resolve_coding_tables_dir(raw)
+    coding_tables_dir = resolve_coding_tables_dir(raw, out)
     files = find_table_files(coding_tables_dir)
     if not files:
         print(f"ERROR: no .xls/.xlsx files under {coding_tables_dir}",
@@ -823,21 +870,35 @@ def main(argv: list[str] | None = None) -> int:
         rows_kept_per_file[path.name] = len(rows)
         all_rows.extend(rows)
 
-    print(f"Collected {len(all_rows)} rows before duplicate resolution.")
+    # Resolve duplicates first: it streams a per-collision WARN to stderr for
+    # every duplicate seg_id, so printing the summary beforehand would bury it
+    # above that wall of warnings. Emit the whole summary as one contiguous
+    # block afterwards, in the order rows flow through the pipeline.
     kept, dup_dropped = resolve_duplicates(all_rows, attribute_names)
-    print(f"After duplicate resolution: {len(kept)} kept, "
-          f"{len(dup_dropped)} duplicate row(s) dropped.")
     if drop_counts:
-        print(f"Rows dropped for other reasons ({sum(drop_counts.values())} total):")
+        print(f"Rows dropped during parsing ({sum(drop_counts.values())} total):")
         for reason, count in drop_counts.most_common():
             print(f"  {reason}: {count}")
-    total_rows_with_missing = sum(rows_with_missing_attrs_per_file.values())
+    print(f"Collected {len(all_rows)} rows before duplicate resolution.")
+    print(f"After duplicate resolution: {len(kept)} kept, "
+          f"{len(dup_dropped)} duplicate row(s) dropped.")
+
+    # Missing-attribute tallies computed over the final kept rows so every
+    # count below refers to the written output (the per-file dicts gathered
+    # during parsing are pre-dedup and would over-count by the duplicates).
+    missing_per_attr_kept: Counter = Counter()
+    total_rows_with_missing = 0
+    for rec in kept:
+        row_has_missing = False
+        for attr in attribute_names:
+            if rec.get(attr) == MISSING_ATTR_CODE:
+                missing_per_attr_kept[attr] += 1
+                row_has_missing = True
+        if row_has_missing:
+            total_rows_with_missing += 1
     if total_rows_with_missing:
         attr_missing_totals = sorted(
-            (
-                (attr, sum(v.get(attr, 0) for v in missing_rows_per_attr_per_file.values()))
-                for attr in attribute_names
-            ),
+            ((attr, missing_per_attr_kept.get(attr, 0)) for attr in attribute_names),
             key=lambda kv: (-kv[1], kv[0]),
         )
         print(f"Rows kept with at least one missing (-1) attribute: "
@@ -850,7 +911,7 @@ def main(argv: list[str] | None = None) -> int:
     entirely_file_empty = [
         attr for attr in attribute_names
         if int(empty_attr_file_counts[attr]) > 0
-        and sum(v.get(attr, 0) for v in missing_rows_per_attr_per_file.values()) == 0
+        and missing_per_attr_kept.get(attr, 0) == 0
     ]
     if entirely_file_empty:
         print("Attributes entirely absent from contributing files (no kept rows generated):")
@@ -905,7 +966,7 @@ def main(argv: list[str] | None = None) -> int:
             },
             "rows": {
                 "kept": len(kept),
-                "with_any_missing_attribute": sum(rows_with_missing_attrs_per_file.values()),
+                "with_any_missing_attribute": total_rows_with_missing,
                 "dropped_total": sum(drop_counts.values()),
                 "dropped_by_reason": dict(drop_counts),
                 "dropped_duplicates": len(dup_dropped),
@@ -916,9 +977,7 @@ def main(argv: list[str] | None = None) -> int:
         "attributes": {
             attr: {
                 **({"num_files_empty": nfe} if (nfe := int(empty_attr_file_counts[attr])) > 0 else dict()),
-                **({"total_rows_missing": trm} if (trm := sum(
-                    v.get(attr, 0) for v in missing_rows_per_attr_per_file.values()
-                )) > 0 else dict()),
+                **({"total_rows_missing": trm} if (trm := missing_per_attr_kept.get(attr, 0)) > 0 else dict()),
                 **({"num_files_unknown_code": uc} if len(uc := dict(unknown_codes.get(attr, Counter()))) > 0 else dict()),
             }
             for attr in attribute_names
