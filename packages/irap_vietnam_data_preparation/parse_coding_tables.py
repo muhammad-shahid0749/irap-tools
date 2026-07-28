@@ -42,8 +42,9 @@ Validation rules (see irap_vietnam_data_preparation/vietnam_data_preparation.md)
     * any attribute IRAP code is not in attribute_value_to_irap_number,
     * the optional ``offset_distance_m`` column (distance in meters between the
       row's FPZ image coordinates and its annotation coordinates) is present,
-      non-blank, and greater than 10.0 (rows whose annotation sits too far from
-      the FPZ point are dropped; the column is ignored when absent or blank).
+      non-blank, and greater than MAX_ANNOT_LOC_OFFSET_M (rows whose annotation
+      sits too far from the FPZ point are dropped; the column is ignored when
+      absent or blank).
 - Duplicate segment ids across the entire dataset are resolved by keeping
   the row with the most non-empty attribute cells; warns on every collision.
 """
@@ -57,6 +58,7 @@ import shutil
 import sys
 import zipfile
 from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import typing as T
@@ -629,6 +631,9 @@ def process_file(
             "seg_id": str(seg_id),
             "comments": comments,
             "source_file": path.name,
+            # 1-based source spreadsheet row (matches warning numbering);
+            # provenance for downstream tooling. Dropped before rows.parquet.
+            "source_row": idx + 1,
         }
         rec.update(attrs)
         missing_attrs = [a for a, v in attrs.items() if v == MISSING_ATTR_CODE]
@@ -762,34 +767,71 @@ def resolve_duplicates(
 
 
 # -----------------------------------------------------------------------------
-# CLI
+# Parsing entry points (shared by the CLI and other tools, e.g. cross-annotator
+# evaluation, which need the pre-dedup rows)
 # -----------------------------------------------------------------------------
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+class ParseSetupError(Exception):
+    """Raised when the dataset layout/inputs are unusable. Carries an exit code."""
 
-    parser.add_argument("data_dir", type=Path,
-                        help="IRAP_Vietnam dataset root.")
-    parser.add_argument(
-        "--drop-rows-missing-attributes", action="store_true",
-        help="Drop rows with any blank attribute cell (old behaviour). "
-             "By default such rows are kept with the missing cells set to "
-             f"{MISSING_ATTR_CODE} (MISSING_ATTR_CODE).",
-    )
-    args = parser.parse_args(argv)
+    def __init__(self, message: str, exit_code: int) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
 
-    raw = layout.raw_dir(args.data_dir)
-    out = layout.work_dir(args.data_dir)
+
+@dataclass
+class ParseInputs:
+    """Resolved inputs for parsing a dataset's coding tables."""
+
+    attribute_names: list[str]
+    valid_codes: dict[str, set[int]]
+    ignored_attributes: list[str]
+    name_mapping: dict[str, str]
+    coding_tables_dir: Path
+    files: list[Path]
+
+
+@dataclass
+class ParseReport:
+    """Mutable bookkeeping gathered while parsing, used to build parse_report.json.
+
+    Pass an instance to :func:`collect_all_rows` to collect it; pass ``None``
+    there to parse without the (otherwise unused) bookkeeping.
+    """
+
+    drop_counts: Counter = field(default_factory=Counter)
+    unknown_codes: dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    empty_attr_file_counts: Counter = field(default_factory=Counter)
+    missing_rows_per_attr_per_file: dict[str, dict[str, int]] = field(default_factory=dict)
+    non_empty_rows_per_file: dict[str, int] = field(default_factory=dict)
+    drop_counts_per_file: dict[str, Counter] = field(default_factory=dict)
+    empty_attrs_per_file: dict[str, list[str]] = field(default_factory=dict)
+    rows_with_missing_attrs_per_file: dict[str, int] = field(default_factory=dict)
+    rows_kept_per_file: dict[str, int] = field(default_factory=dict)
+    skipped_files: dict[str, str] = field(default_factory=dict)
+    processed_files: list[str] = field(default_factory=list)
+
+
+def prepare_parse_inputs(data_dir: Path) -> ParseInputs:
+    """Resolve attribute metadata, ignore/rename config, and the coding-table files.
+
+    Loads ``attribute_metadata.json`` and the ``incompatible_attributes.json``
+    mapping, applies the ignored-attribute filter, and (re-)extracts the coding
+    tables. Raises :class:`ParseSetupError` (with a CLI exit code) if the raw
+    dir, metadata file, or any spreadsheet files are missing.
+    """
+    raw = layout.raw_dir(data_dir)
+    out = layout.work_dir(data_dir)
     if not raw.is_dir():
-        print(f"ERROR: {raw} not found. Expected a directory containing "
-              f"attribute_metadata.json and coding-tables[.zip].",
-              file=sys.stderr)
-        return 2
-    attr_meta_path = layout.attr_meta_path(args.data_dir)
+        raise ParseSetupError(
+            f"{raw} not found. Expected a directory containing "
+            f"attribute_metadata.json and coding-tables[.zip].",
+            2,
+        )
+    attr_meta_path = layout.attr_meta_path(data_dir)
     if not attr_meta_path.is_file():
-        print(f"ERROR: {attr_meta_path} not found.", file=sys.stderr)
-        return 2
+        raise ParseSetupError(f"{attr_meta_path} not found.", 2)
 
     attribute_names, valid_codes = load_attribute_metadata(attr_meta_path)
     ignored_attributes = load_ignored_attributes(Path(__file__).parent)
@@ -809,26 +851,36 @@ def main(argv: list[str] | None = None) -> int:
     coding_tables_dir = resolve_coding_tables_dir(raw, out)
     files = find_table_files(coding_tables_dir)
     if not files:
-        print(f"ERROR: no .xls/.xlsx files under {coding_tables_dir}",
-              file=sys.stderr)
-        return 1
+        raise ParseSetupError(
+            f"no .xls/.xlsx files under {coding_tables_dir}", 1
+        )
     print(f"Found {len(files)} spreadsheet file(s) under {coding_tables_dir}")
+    return ParseInputs(
+        attribute_names=attribute_names,
+        valid_codes=valid_codes,
+        ignored_attributes=ignored_attributes,
+        name_mapping=name_mapping,
+        coding_tables_dir=coding_tables_dir,
+        files=files,
+    )
 
-    drop_counts: Counter = Counter()
-    unknown_codes: dict[str, Counter] = defaultdict(Counter)
-    empty_attr_file_counts: Counter = Counter()
-    missing_rows_per_attr_per_file: dict[str, dict[str, int]] = {}
-    non_empty_rows_per_file: dict[str, int] = {}
-    drop_counts_per_file: dict[str, Counter] = {}
-    empty_attrs_per_file: dict[str, list[str]] = {}
-    rows_with_missing_attrs_per_file: dict[str, int] = {}
-    rows_kept_per_file: dict[str, int] = {}
-    skipped_files: dict[str, str] = {}
-    processed_files: list[str] = []
+
+def collect_all_rows(
+    inputs: ParseInputs,
+    *,
+    drop_missing_attrs: bool = False,
+    report: ParseReport | None = None,
+) -> list[dict]:
+    """Parse every coding-table file and return the pre-dedup rows.
+
+    This is the row list *before* :func:`resolve_duplicates`, so a ``seg_id``
+    coded by several annotators appears once per source file. When ``report`` is
+    given its bookkeeping fields are populated for parse_report.json; when
+    ``None`` the tallies are gathered into a scratch instance and discarded.
+    """
+    rep = report if report is not None else ParseReport()
     all_rows: list[dict] = []
-
-    for path in tqdm(files, desc="Parsing", unit="file"):
-        df_head = None
+    for path in tqdm(inputs.files, desc="Parsing", unit="file"):
         try:
             df_head = read_sheet(path)
         except Exception as e:
@@ -836,49 +888,99 @@ def main(argv: list[str] | None = None) -> int:
             raise
         if df_head.empty:
             print(f"INFO: {path.name}: skipping – empty sheet", file=sys.stderr)
-            skipped_files[path.name] = "empty sheet"
+            rep.skipped_files[path.name] = "empty sheet"
             continue
-        if not file_is_coding_table(df_head, attribute_names):
+        if not file_is_coding_table(df_head, inputs.attribute_names):
             print(f"INFO: {path.name}: skipping – not a coding table "
                   f"(no 'Section' column or no recognizable attribute column)",
                   file=sys.stderr)
-            skipped_files[path.name] = (
+            rep.skipped_files[path.name] = (
                 "not a coding table (no 'Section' column or no recognizable "
                 "attribute column)"
             )
             continue
         try:
             rows = process_file(
-                path, attribute_names, valid_codes,
-                drop_counts, unknown_codes,
-                ignored_attributes=ignored_attributes,
-                name_mapping=name_mapping,
-                empty_attr_file_counts=empty_attr_file_counts,
-                missing_rows_per_attr_per_file=missing_rows_per_attr_per_file,
-                non_empty_rows_per_file=non_empty_rows_per_file,
-                drop_counts_per_file=drop_counts_per_file,
-                empty_attrs_per_file=empty_attrs_per_file,
-                rows_with_missing_attrs_per_file=rows_with_missing_attrs_per_file,
-                drop_missing_attrs=args.drop_rows_missing_attributes,
+                path, inputs.attribute_names, inputs.valid_codes,
+                rep.drop_counts, rep.unknown_codes,
+                ignored_attributes=inputs.ignored_attributes,
+                name_mapping=inputs.name_mapping,
+                empty_attr_file_counts=rep.empty_attr_file_counts,
+                missing_rows_per_attr_per_file=rep.missing_rows_per_attr_per_file,
+                non_empty_rows_per_file=rep.non_empty_rows_per_file,
+                drop_counts_per_file=rep.drop_counts_per_file,
+                empty_attrs_per_file=rep.empty_attrs_per_file,
+                rows_with_missing_attrs_per_file=rep.rows_with_missing_attrs_per_file,
+                drop_missing_attrs=drop_missing_attrs,
             )
         except ValueError as e:
             print(f"WARN: {path.name}: skipping – column validation failed:\n{e}",
                   file=sys.stderr)
-            skipped_files[path.name] = f"column validation failed: {e}"
+            rep.skipped_files[path.name] = f"column validation failed: {e}"
             continue
-        processed_files.append(path.name)
-        rows_kept_per_file[path.name] = len(rows)
+        rep.processed_files.append(path.name)
+        rep.rows_kept_per_file[path.name] = len(rows)
         all_rows.extend(rows)
+    return all_rows
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+
+    parser.add_argument("data_dir", type=Path,
+                        help="IRAP_Vietnam dataset root.")
+    parser.add_argument(
+        "--drop-rows-missing-attributes", action="store_true",
+        help="Drop rows with any blank attribute cell (old behaviour). "
+             "By default such rows are kept with the missing cells set to "
+             f"{MISSING_ATTR_CODE} (MISSING_ATTR_CODE).",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        inputs = prepare_parse_inputs(args.data_dir)
+    except ParseSetupError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return e.exit_code
+
+    out = layout.work_dir(args.data_dir)
+    attribute_names = inputs.attribute_names
+
+    rep = ParseReport()
+    all_rows = collect_all_rows(
+        inputs,
+        drop_missing_attrs=args.drop_rows_missing_attributes,
+        report=rep,
+    )
 
     # Resolve duplicates first: it streams a per-collision WARN to stderr for
     # every duplicate seg_id, so printing the summary beforehand would bury it
     # above that wall of warnings. Emit the whole summary as one contiguous
     # block afterwards, in the order rows flow through the pipeline.
     kept, dup_dropped = resolve_duplicates(all_rows, attribute_names)
-    if drop_counts:
-        print(f"Rows dropped during parsing ({sum(drop_counts.values())} total):")
-        for reason, count in drop_counts.most_common():
+    total_dropped = sum(rep.drop_counts.values())
+    if rep.drop_counts:
+        total_rows = len(all_rows) + total_dropped
+        print(f"Rows dropped during parsing ({total_dropped}/{total_rows} total):")
+        for reason, count in rep.drop_counts.most_common():
             print(f"  {reason}: {count}")
+    if rep.drop_counts_per_file:
+        print("Rows dropped during parsing, per file:")
+        for fname in sorted(
+            rep.drop_counts_per_file,
+            key=lambda f: (-sum(rep.drop_counts_per_file[f].values()), f),
+        ):
+            fc = rep.drop_counts_per_file[fname]
+            file_dropped = sum(fc.values())
+            file_total = rep.rows_kept_per_file.get(fname, 0) + file_dropped
+            print(f"  {fname} ({file_dropped}/{file_total} total):")
+            for reason, count in fc.most_common():
+                print(f"    {reason}: {count}")
     print(f"Collected {len(all_rows)} rows before duplicate resolution.")
     print(f"After duplicate resolution: {len(kept)} kept, "
           f"{len(dup_dropped)} duplicate row(s) dropped.")
@@ -905,21 +1007,23 @@ def main(argv: list[str] | None = None) -> int:
               f"{total_rows_with_missing}")
         for attr, count in attr_missing_totals:
             if count:
-                nfe = int(empty_attr_file_counts[attr])
+                nfe = int(rep.empty_attr_file_counts[attr])
                 suffix = f"  [entirely absent in {nfe} file(s)]" if nfe > 0 else ""
                 print(f"  {attr}: {count}{suffix}")
     entirely_file_empty = [
         attr for attr in attribute_names
-        if int(empty_attr_file_counts[attr]) > 0
+        if int(rep.empty_attr_file_counts[attr]) > 0
         and missing_per_attr_kept.get(attr, 0) == 0
     ]
     if entirely_file_empty:
         print("Attributes entirely absent from contributing files (no kept rows generated):")
         for attr in entirely_file_empty:
-            print(f"  {attr}: entirely absent in {int(empty_attr_file_counts[attr])} file(s)")
+            print(f"  {attr}: entirely absent in {int(rep.empty_attr_file_counts[attr])} file(s)")
 
     out.mkdir(parents=True, exist_ok=True)
-    df_out = pd.DataFrame(kept)
+    # ``source_row`` is provenance for other tools (e.g. cross-annotator eval);
+    # keep it out of rows.parquet so the public schema stays stable.
+    df_out = pd.DataFrame(kept).drop(columns=["source_row"], errors="ignore")
     parquet_path = out / layout.ROWS_PARQUET
     df_out.to_parquet(parquet_path, index=False)
     print(f"Wrote {parquet_path} ({len(df_out)} rows)")
@@ -927,17 +1031,17 @@ def main(argv: list[str] | None = None) -> int:
     def file_entry(fname: str) -> dict:
         entry: dict = {
             "status": "processed",
-            "num_rows_non_empty": non_empty_rows_per_file.get(fname, 0),
-            "num_rows_kept": rows_kept_per_file.get(fname, 0),
-            "num_rows_with_missing_attributes": rows_with_missing_attrs_per_file.get(fname, 0),
+            "num_rows_non_empty": rep.non_empty_rows_per_file.get(fname, 0),
+            "num_rows_kept": rep.rows_kept_per_file.get(fname, 0),
+            "num_rows_with_missing_attributes": rep.rows_with_missing_attrs_per_file.get(fname, 0),
         }
-        file_drops = drop_counts_per_file.get(fname)
+        file_drops = rep.drop_counts_per_file.get(fname)
         if file_drops:
             entry["rows_dropped_by_reason"] = dict(file_drops)
-        empty_attrs = empty_attrs_per_file.get(fname)
+        empty_attrs = rep.empty_attrs_per_file.get(fname)
         if empty_attrs:
             entry["empty_attributes"] = empty_attrs
-        missing_per_attr = missing_rows_per_attr_per_file.get(fname)
+        missing_per_attr = rep.missing_rows_per_attr_per_file.get(fname)
         if missing_per_attr:
             entry["num_rows_missing_per_attribute"] = dict(
                 sorted(missing_per_attr.items(), key=lambda kv: (-kv[1], kv[0]))
@@ -945,30 +1049,34 @@ def main(argv: list[str] | None = None) -> int:
         return entry
 
     files_section: dict[str, dict] = {}
-    for fname in processed_files:
+    for fname in rep.processed_files:
         files_section[fname] = file_entry(fname)
-    for fname, reason in sorted(skipped_files.items()):
+    for fname, reason in sorted(rep.skipped_files.items()):
         files_section[fname] = {"status": "skipped", "skip_reason": reason}
     files_section = dict(sorted(files_section.items()))
 
     report = {
         "meta": {
             "parsed_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "coding_tables_dir": str(coding_tables_dir.relative_to(args.data_dir)),
-            "attribute_metadata_path": str(attr_meta_path.relative_to(args.data_dir)),
-            "ignored_attributes": sorted(ignored_attributes),
+            "coding_tables_dir": str(
+                inputs.coding_tables_dir.relative_to(args.data_dir)
+            ),
+            "attribute_metadata_path": str(
+                layout.attr_meta_path(args.data_dir).relative_to(args.data_dir)
+            ),
+            "ignored_attributes": sorted(inputs.ignored_attributes),
         },
         "summary": {
             "files": {
-                "total": len(files),
-                "processed": len(processed_files),
-                "skipped": len(skipped_files),
+                "total": len(inputs.files),
+                "processed": len(rep.processed_files),
+                "skipped": len(rep.skipped_files),
             },
             "rows": {
                 "kept": len(kept),
                 "with_any_missing_attribute": total_rows_with_missing,
-                "dropped_total": sum(drop_counts.values()),
-                "dropped_by_reason": dict(drop_counts),
+                "dropped_total": total_dropped,
+                "dropped_by_reason": dict(rep.drop_counts),
                 "dropped_duplicates": len(dup_dropped),
             },
             "num_sections": df_out["section"].nunique() if not df_out.empty else 0,
@@ -976,9 +1084,9 @@ def main(argv: list[str] | None = None) -> int:
         "files": files_section,
         "attributes": {
             attr: {
-                **({"num_files_empty": nfe} if (nfe := int(empty_attr_file_counts[attr])) > 0 else dict()),
+                **({"num_files_empty": nfe} if (nfe := int(rep.empty_attr_file_counts[attr])) > 0 else dict()),
                 **({"total_rows_missing": trm} if (trm := missing_per_attr_kept.get(attr, 0)) > 0 else dict()),
-                **({"num_files_unknown_code": uc} if len(uc := dict(unknown_codes.get(attr, Counter()))) > 0 else dict()),
+                **({"num_files_unknown_code": uc} if len(uc := dict(rep.unknown_codes.get(attr, Counter()))) > 0 else dict()),
             }
             for attr in attribute_names
         },

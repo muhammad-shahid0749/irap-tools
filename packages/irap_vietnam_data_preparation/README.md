@@ -93,6 +93,12 @@ label). The `parse_report.json` and stdout summary record which attributes are
 missing in how many kept rows, per file and overall. Pass
 `--drop-rows-missing-attributes` to drop any row with a blank attribute cell.
 
+#### Optional – Cross-annotator evaluation
+
+```bash
+python cross_annotator_eval.py $DATA_DIR
+```
+
 ### Stage 3b – Build BiH-compatible metadata
 
 ```bash
