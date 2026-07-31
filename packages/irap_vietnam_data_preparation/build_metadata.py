@@ -15,9 +15,11 @@ Writes (into <data_dir>/ directly):
     attribute_metadata.json               (copy of _raw/attribute_metadata.json)
     unlabeled_segment_ids.json
     unlabeled_sequence_id_to_data.json    (sequence_id -> {segs, centroid}) for editor
-    unlabeled_unlocated_segment_ids.json  (only if non-empty: seg_ids from image
-                                           folders with no labeled siblings, so
-                                           no map coordinate is derivable)
+    unlabeled_unlocated_segment_ids.json  (seg_ids from image folders with no
+                                           labeled siblings, so no map coordinate
+                                           is derivable; written only when
+                                           non-empty, and deleted if a previous
+                                           build left one behind)
 
 Writes (into <data_dir>/_work/):
     build_report.json                     (counts, warnings)
@@ -473,12 +475,15 @@ def main(argv: list[str] | None = None) -> int:
         json.dump(unlabeled_sequence_id_to_data, f, indent=2, ensure_ascii=False)
     print(f"Wrote {unlabeled_sequence_path}")
 
+    unlocated_path = layout.unlabeled_unlocated_segment_ids_path(data_dir)
     if unplaceable_unlabeled_seg_ids:
-        unlocated_path = layout.unlabeled_unlocated_segment_ids_path(data_dir)
         unlocated_sorted = sorted(unplaceable_unlabeled_seg_ids, key=int)
         with open(unlocated_path, "w", encoding="utf-8") as f:
             json.dump(unlocated_sorted, f, indent=2, ensure_ascii=False)
         print(f"Wrote {unlocated_path}")
+    elif unlocated_path.exists():
+        unlocated_path.unlink()
+        print(f"Removed stale {unlocated_path}")
 
     report = {
         "num_rows_in": int(num_rows_in),

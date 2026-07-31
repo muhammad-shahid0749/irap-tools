@@ -7,7 +7,7 @@ For the rationale and decisions behind each step see [`vietnam_data_preparation.
 ## Prerequisites
 
 - `unrar` (preferred) or `7z` on `PATH` for image extraction.
-- Python packages: `uv pip install pandas openpyxl xlrd pyarrow tqdm numpy scikit-learn`. For the Streamlit-based manual split editor, also install `streamlit>=1.35 plotly`.
+- Python packages: `uv pip install pandas openpyxl xlrd pyarrow tqdm numpy`. The Streamlit-based split editor additionally needs `streamlit>=1.35 plotly`, and the optional cross-annotator evaluation needs `scikit-learn`.
 - The `IRAP_Vietnam/` dataset root, with `_raw/` populated (see "Layout" below).
 
 ## Layout
@@ -116,13 +116,13 @@ is written to `_work/build_report.json`.
 
 #### Output format
 
-Both tools write `splits.json` as `{<split_name>: [seg_id, ...]}` with segment ids as strings. Keys:
+`split_editor.py` writes `splits.json` as `{<split_name>: [seg_id, ...]}` with segment ids as strings. Keys:
 
 - `train`, `val`, `test` – labeled segments assigned to each split.
 - `unlabeled_train`, `unlabeled_val`, `unlabeled_test` – unlabeled segments assigned the same way. Omitted if `unlabeled_sequence_id_to_data.json` is not present in the metadata directory.
 - `unlabeled_unlocated` – unlabeled segments from image folders that have no labeled siblings, so no map coordinate is derivable. Auto-populated from `unlabeled_unlocated_segment_ids.json` and not user-editable in the map GUI. Omitted if the file is absent.
 
-#### Manual (map GUI)
+#### Map GUI
 
 ```bash
 streamlit run split_editor.py -- $DATA_DIR
@@ -131,25 +131,21 @@ streamlit run split_editor.py -- $DATA_DIR
 Opens a browser-based map showing all road sections as coloured polylines.
 
 1. Pick an active split in the sidebar (`train`, `val`, `test`, or `none`).
-2. **Draw a rectangle** on the map – all sections whose centroid falls
-   inside are assigned to the active split.
+2. **Draw a rectangle** on the map – all sections whose centroid falls inside are assigned to the active split.
 3. Use **Undo** to revert the last batch, **Reset** to clear all.
 4. **Save** writes `splits.json` (see *Output format* above).
 
-If `splits.json` already exists in the metadata directory it is used as the
-starting assignment (useful for tweaking an automatic result).
+##### Class coverage
+
+The sidebar reports how well each split covers the attribute classes – a class being one (attribute, IRAP code) pair from `required_attributes` in `segment_id_to_road_data.json`. Cells left at `-1` (`MISSING_ATTR_CODE`) are an ignore label, so a never-coded attribute contributes no classes.
+
+Support is counted in **sequences**: a rare class seen in multiple segments of a single section is one example, not 300.
+
+Each split's row reads `N classes absent (M fixable)`:
+- **absent** – the split has no segment of the class.
+- **fixable** – of those, the ones occurring in at least `3 × n_min` sequences dataset-wide.
+
 Requires `streamlit >= 1.35`.
-
-#### Automatic (K-Means)
-
-Note: This procedure is experimental and not recommended. The code is AI-generated and not reviewed.
-
-```bash
-python make_splits.py $DATA_DIR
-```
-
-Per-section deterministic allocation: whole sections go into one split,
-giving geographically non-overlapping splits with no leakage.
 
 ## Stage 4 – clean up
 

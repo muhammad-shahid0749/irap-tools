@@ -40,7 +40,7 @@ substantial changes.
 10. `road_id` = section string, except for sections containing a continuity
     violation (Decision 3) which become `<section>__part0`, `<section>__part1`,
     …. `segment_id_to_road_data.json` keeps the original section string per
-    segment, so per-section splits in `make_splits.py` are unaffected.
+    segment, so splits keyed on the section string are unaffected.
 11. Splits: per-section assignment; this is the last step.
 12. RGB only.
 13. Image filenames: `f"{section}_seg{seg_id}.png"`. Confirmed.
@@ -332,9 +332,9 @@ Steps:
    (with consecutiveness validation, §3.5), and copy the supplied
    `attribute_metadata.json` verbatim. No image reading required;
    idempotent.
-3. **`make_splits.py`** – per-section random allocation to train/val/test
-   with a fixed seed; writes `splits.json`. Run last so we can re-roll
-   without redoing parsing.
+3. **`split_editor.py`** – map GUI for assigning whole sequences to
+   train/val/test by drawing boxes; writes `splits.json`. Run last so the
+   splits can be redrawn without redoing parsing.
 4. **Loader factory** – `make_vietnam_data` in
    `vidlu_irap_gaim/data/vietnam_dataset.py` (a thin wrapper over
    `BihSequence`). The class itself is reused unchanged.

@@ -1,7 +1,7 @@
 """Delete all pipeline outputs generated after the extraction step.
 
 Removes the files produced by ``parse_coding_tables.py``,
-``build_metadata.py`` and ``make_splits.py``, leaving the inputs to the
+``build_metadata.py`` and ``split_editor.py``, leaving the inputs to the
 extraction step (``_raw/``) and its outputs (``FRAMES/`` and
 ``_work/FRAMES_duplicates/``) intact.
 
@@ -33,7 +33,7 @@ def _targets(data_dir: Path) -> list[Path]:
         layout.unlabeled_segment_ids_path(data_dir),
         layout.unlabeled_sequence_id_to_data_path(data_dir),
         layout.unlabeled_unlocated_segment_ids_path(data_dir),
-        # make_splits.py / split_editor.py
+        # split_editor.py
         metadata / "splits.json",
         # _work/ itself if it ends up empty (FRAMES_duplicates may keep it alive)
         work,
