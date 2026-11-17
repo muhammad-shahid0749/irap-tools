@@ -2,33 +2,37 @@
 
 Each archive contains entries like ``splitN/<video_dir>/<video_dir>_segNNN.png``.
 The script strips the outer ``splitN/`` wrapper (an arbitrary RAR-partitioning
-artifact) and writes files under ``<out>/<video_dir>/<basename>.png``, preserving
+artifact) and writes files under ``FRAMES/<video_dir>/<basename>.png``, preserving
 the per-video grouping. Same-basename files across different video directories
 are not collisions; only two archives writing the **same post-strip path** count.
-By default the script aborts on any such duplicate path; pass
-``--ignore-duplicates`` to proceed – duplicates that share (size, CRC32) are
-silently kept (first archive wins), while duplicates with differing content
-trigger a warning.
+By default the script aborts on any such duplicate path. With
+``--ignore-duplicates`` it proceeds and keeps one copy of each path, which is
+not necessarily the one of the first archive. It warns about the paths whose
+copies differ in size or CRC32.
 
-Archives whose name contains ``missing_segments`` hold corrected segment
-images; they are applied after the regular archives, unconditionally replacing
-same-named files, and do not participate in the duplicate check (see
-:func:`_apply_missing_segments`).
+Patch archives hold corrected or additional segment images. They are the
+archives whose name contains ``missing_segments`` or ``new files`` (see
+:data:`PATCH_ARCHIVE_NAME_RE`). They are applied after the regular archives,
+unconditionally replacing same-named files, and do not participate in the
+duplicate check (see :func:`_apply_patch_archives`).
 
 The images output directory is wiped before extraction so that no stale or
 partially-written files from a previous run survive. The script prompts for
 confirmation when the directory is non-empty; pass ``--yes`` to skip the
-prompt.
+prompt. With ``--patches-only`` the script keeps the directory and only applies
+the patch archives to it, e.g. after an interrupted patch step or when a patch
+archive is added.
 
 Requires ``unrar`` (preferred) or ``7z`` on the PATH.
 
 Usage:
-    python irap_vietnam_data_preparation/extract_images.py <data_dir>
+    python extract_images.py <data_dir> [--ignore-duplicates] [--patches-only]
 
 Reads ``<data_dir>/_raw/image_rars/*.rar``; writes nested images into
-``<data_dir>/images/<video_dir>/``.
+``<data_dir>/FRAMES/<video_dir>/``.
 """
 import argparse
+import os
 import re
 import shutil
 import subprocess
@@ -43,10 +47,15 @@ from tqdm import tqdm
 import layout
 
 
-SPLIT_WRAPPER_RE = re.compile(r"^split\d+/", re.IGNORECASE)
+SPLIT_DIR_NAME_RE = re.compile(r"split\d+", re.IGNORECASE)
+SPLIT_WRAPPER_RE = re.compile(rf"^{SPLIT_DIR_NAME_RE.pattern}/", re.IGNORECASE)
 
 # Captures the video_dir prefix of a "<video_dir>_segN.png" filename.
 SEG_VIDEO_DIR_RE = re.compile(r"^(.*)_seg\d+\.png$", re.IGNORECASE)
+
+# Matches the name of a patch archive, whose images replace or add to those of the
+# regular archives.
+PATCH_ARCHIVE_NAME_RE = re.compile(r"missing_segments|new[ _]files", re.IGNORECASE)
 
 
 def strip_split_wrapper(internal_path: str) -> str:
@@ -66,9 +75,8 @@ def video_dir_from_filename(filename: str) -> str | None:
     return m.group(1) if m else None
 
 
-def is_missing_segments(archive: Path) -> bool:
-    """True for archives holding corrected segments that replace regular files."""
-    return "missing_segments" in archive.name.lower()
+def is_patch_archive(archive: Path) -> bool:
+    return PATCH_ARCHIVE_NAME_RE.search(archive.name) is not None
 
 
 def find_extractor() -> tuple[str, str]:
@@ -145,6 +153,28 @@ def list_entries(binary: str, kind: str, archive: Path
     return entries
 
 
+def _index_archives(binary: str, kind: str, archives: list[Path]
+                   ) -> dict[Path, list[tuple[str, int, str | None]]]:
+    """Return ``{archive: list_entries(...)}``, printing each archive's entry count."""
+    entries: dict[Path, list[tuple[str, int, str | None]]] = {}
+    for a in archives:
+        entries[a] = list_entries(binary, kind, a)
+        print(f"  {a.name}: {len(entries[a])} entries")
+    return entries
+
+
+def _extract_cmd(binary: str, kind: str, archive: Path, out: Path,
+                 members: list[str] | None = None) -> list[str]:
+    """Build the unrar/7z command extracting *archive* (or just *members*) into *out*."""
+    if kind == "unrar":
+        cmd = [binary, "x", "-o-", "-y", str(archive), str(out) + "/"]
+    else:
+        # -bb1 emits one line per file; -bso0/-bsp0 silence summary/progress.
+        cmd = [binary, "x", "-aos", "-bb1", "-bso1", "-bsp0",
+               f"-o{out}", str(archive)]
+    return cmd + (members or [])
+
+
 def _run_extraction(
         cmd: list[str], kind: str, total: int, desc: str, position: int = 0,
 ) -> None:
@@ -207,13 +237,8 @@ def extract(binary: str, kind: str, archive: Path, out: Path, *,
     extractions run concurrently.
     """
     out.mkdir(parents=True, exist_ok=True)
-    if kind == "unrar":
-        cmd = [binary, "x", "-o-", "-y", str(archive), str(out) + "/"]
-    else:
-        # -bb1 emits one line per file; -bso0/-bsp0 silence summary/progress.
-        cmd = [binary, "x", "-aos", "-bb1", "-bso1", "-bsp0",
-               f"-o{out}", str(archive)]
-    _run_extraction(cmd, kind, num_entries, archive.name, position)
+    _run_extraction(_extract_cmd(binary, kind, archive, out),
+                    kind, num_entries, archive.name, position)
 
 
 def _flatten_split_wrappers(out: Path) -> None:
@@ -225,7 +250,7 @@ def _flatten_split_wrappers(out: Path) -> None:
     kept and the duplicate from the splitN/ source is discarded).
     """
     for split_dir in sorted(out.iterdir()):
-        if not (split_dir.is_dir() and re.fullmatch(r"split\d+", split_dir.name, re.IGNORECASE)):
+        if not (split_dir.is_dir() and SPLIT_DIR_NAME_RE.fullmatch(split_dir.name)):
             continue
         _merge_dir_into(split_dir, out)
         if not any(split_dir.iterdir()):
@@ -270,15 +295,10 @@ def _compute_collisions(
     return dict(by_name), collisions, total_bytes
 
 
-def _print_collision_group(
-        group: dict[str, list], stream, *, label: str | None = None,
-) -> None:
-    """Print up to 50 entries from *group* with optional *label* prefix."""
+def _print_collision_group(group: dict[str, list], stream, *, label: str) -> None:
+    """Print up to 50 entries from *group*, each prefixed with *label*."""
     for name, lst in list(group.items())[:50]:
-        if label is None:
-            print(f"  {name}", file=stream)
-        else:
-            print(f"  {label}: {name}", file=stream)
+        print(f"  {label}: {name}", file=stream)
         for archive, inner, size, crc in lst:
             crc_s = crc or "n/a"
             print(f"    in {archive.name}: {inner} "
@@ -290,7 +310,10 @@ def _print_collision_group(
 def _report_collisions(
         collisions: dict[str, list],
         ignore_duplicates: bool) -> None:
-    """Print a collision report; abort with ``SystemExit(2)`` unless *ignore_duplicates*."""
+    """Print a collision report; abort with ``SystemExit(2)`` unless *ignore_duplicates*.
+
+    The copies of a path are identical if they have equal size and CRC32.
+    """
     differing: dict[str, list] = {}
     ambiguous: dict[str, list] = {}
     identical: dict[str, list] = {}
@@ -305,14 +328,7 @@ def _report_collisions(
         else:
             identical[name] = lst
 
-    if not ignore_duplicates:
-        print(f"ERROR: {len(collisions)} duplicate path(s) across archives "
-              f"(pass --ignore-duplicates to proceed):", file=sys.stderr)
-        _print_collision_group(collisions, sys.stderr)
-        raise SystemExit(2)
-
-    print(f"  {len(collisions)} duplicate path(s); ignoring "
-          f"(first archive wins on extraction):")
+    print(f"  {len(collisions)} duplicate path(s) across archives:")
     print(f"    identical content: {len(identical)}")
     print(f"    same size, CRC unavailable in >=1 archive: {len(ambiguous)}")
     print(f"    differing content: {len(differing)}")
@@ -324,6 +340,13 @@ def _report_collisions(
             continue
         _print_collision_group(group, stream, label=label)
 
+    if not ignore_duplicates:
+        print(f"ERROR: {len(collisions)} duplicate path(s) across archives "
+              f"(pass --ignore-duplicates to keep one copy of each).", file=sys.stderr)
+        raise SystemExit(2)
+
+    print("  Ignoring the duplicates: one copy of each path is kept.")
+
 
 def extract_specific(
         binary: str, kind: str, archive: Path, out: Path,
@@ -333,12 +356,7 @@ def extract_specific(
     if not entries:
         return
     out.mkdir(parents=True, exist_ok=True)
-    internal_paths = [e[0] for e in entries]
-    if kind == "unrar":
-        cmd = [binary, "x", "-o-", "-y", str(archive), str(out) + "/"] + internal_paths
-    else:
-        cmd = [binary, "x", "-aos", "-bb1", "-bso1", "-bsp0",
-               f"-o{out}", str(archive)] + internal_paths
+    cmd = _extract_cmd(binary, kind, archive, out, [e[0] for e in entries])
     _run_extraction(cmd, kind, len(entries), f"[dup] {archive.name}", position)
 
 
@@ -390,66 +408,81 @@ def _extract_parallel(
             fut.result()
 
 
-def _apply_missing_segments(
+def _print_path_examples(paths: list[Path], root: Path) -> None:
+    for p in paths[:20]:
+        print(f"    {p.relative_to(root)}", file=sys.stderr)
+    if len(paths) > 20:
+        print(f"    ... and {len(paths) - 20} more", file=sys.stderr)
+
+
+def _apply_patch_archives(
         binary: str, kind: str, archives: list[Path], out: Path, tmp: Path,
         *, jobs: int | None,
 ) -> None:
-    """Extract missing_segments *archives* and merge their files into ``out``.
+    """Extract patch *archives* and merge their files into ``out``.
 
     Each archive is extracted into its own fresh subdirectory of the scratch
     directory ``tmp`` (fresh, so the extractor's skip-if-exists mode never
     triggers and concurrent extractions cannot race). Every
     ``<video_dir>_segN.png`` file is then moved to ``out/<video_dir>/<file>``,
-    unconditionally replacing what the regular archives produced; the owning
-    ``<video_dir>`` is recovered from the filename because the missing_segments
-    archives wrap the video folders in arbitrary (sometimes nested) folders, so
-    the extracted directory structure cannot be trusted the way the regular
+    unconditionally replacing what the regular archives produced. The owning
+    ``<video_dir>`` is recovered from the filename because some patch archives
+    wrap the video folders in arbitrary (sometimes nested) folders, so the
+    extracted directory structure cannot be trusted the way the regular
     ``splitN/`` archives' can. Files not matching the naming convention are
     reported and skipped. Archive subdirectories are merged in sorted order, so
-    on conflicts between missing_segments archives the lexicographically last
-    archive wins, deterministically.
+    for a file in several patch archives the lexicographically last archive
+    wins. Such files are reported.
     """
-    print(f"\nIndexing {len(archives)} missing_segments archive(s)...")
-    entries: dict[Path, list[tuple[str, int, str | None]]] = {}
-    for a in archives:
-        entries[a] = list_entries(binary, kind, a)
-        print(f"  {a.name}: {len(entries[a])} entries")
+    print(f"\nIndexing {len(archives)} patch archive(s)...")
+    entries = _index_archives(binary, kind, archives)
 
     if tmp.exists():
         shutil.rmtree(tmp)
     try:
         _extract_parallel(binary, kind, archives, entries,
-                          lambda a: tmp / a.stem, jobs=jobs,
-                          label="missing_segments")
+                          lambda a: tmp / a.stem, jobs=jobs, label="patch")
 
-        print("Merging missing_segments files into the images directory...")
-        replaced = 0   # overwrote a file the regular archives produced
+        # Moving a file whose data is not on the disk yet can wait for that data, which
+        # takes much longer file by file than for all the files at once.
+        if hasattr(os, "sync"):  # not available on Windows
+            print("Writing the extracted patch files to the disk...")
+            os.sync()
+
+        print("Merging patch files into the images directory...")
+        replaced = 0  # overwrote a file the regular archives produced
         added = 0      # brand-new file
         unmatched: list[Path] = []
-        for sub in sorted(tmp.iterdir()):
-            for src_file in sub.rglob("*"):
-                if not src_file.is_file():
-                    continue
-                video_dir = video_dir_from_filename(src_file.name)
-                if video_dir is None:
-                    unmatched.append(src_file)
-                    continue
-                dst_file = out / video_dir / src_file.name
-                dst_file.parent.mkdir(parents=True, exist_ok=True)
-                if dst_file.exists():
-                    replaced += 1
-                else:
-                    added += 1
-                src_file.replace(dst_file)
+        patched_files: set[Path] = set()
+        files_in_several_archives: set[Path] = set()
+        src_files = [f for sub in sorted(tmp.iterdir()) for f in sub.rglob("*")
+                     if f.is_file()]
+        for src_file in tqdm(src_files, unit="file", desc="Merging", dynamic_ncols=True):
+            video_dir = video_dir_from_filename(src_file.name)
+            if video_dir is None:
+                unmatched.append(src_file)
+                continue
+            dst_file = out / video_dir / src_file.name
+            dst_file.parent.mkdir(parents=True, exist_ok=True)
+            if dst_file in patched_files:
+                files_in_several_archives.add(dst_file)
+            elif dst_file.exists():
+                replaced += 1
+            else:
+                added += 1
+            patched_files.add(dst_file)
+            src_file.replace(dst_file)
 
         if unmatched:
-            print(f"WARN: {len(unmatched)} missing_segments file(s) did not match "
+            print(f"WARN: {len(unmatched)} patch file(s) did not match "
                   f"the <video_dir>_segN.png naming convention and were skipped:",
                   file=sys.stderr)
-            for p in unmatched[:20]:
-                print(f"    {p.relative_to(tmp)}", file=sys.stderr)
-            if len(unmatched) > 20:
-                print(f"    ... and {len(unmatched) - 20} more", file=sys.stderr)
+            _print_path_examples(unmatched, tmp)
+
+        if files_in_several_archives:
+            print(f"WARN: {len(files_in_several_archives)} file(s) are in more than one "
+                  f"patch archive (the last archive in name order wins):", file=sys.stderr)
+            _print_path_examples(sorted(files_in_several_archives), out)
 
         print(f"  {replaced + added} file(s) merged: {replaced} replaced "
               f"existing, {added} newly added.")
@@ -460,16 +493,19 @@ def _apply_missing_segments(
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("data_dir", type=Path,
-                        help="IRAP_Vietnam dataset root.")
+                        help="iRAP-Vietnam dataset root.")
     parser.add_argument("--ignore-duplicates", action="store_true",
-                        help="Proceed when archives share post-strip paths "
-                             "(first archive wins on extraction).")
+                        help="Proceed when archives share post-strip paths, and "
+                             "keep one copy of each.")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="Skip the confirmation prompt before wiping a "
                              "non-empty images directory.")
     parser.add_argument("--jobs", "-j", type=int, default=None,
                         help="Parallel extractions. Default: "
                              "min(num_archives, 4).")
+    parser.add_argument("--patches-only", action="store_true",
+                        help="Apply only the patch archives, to the images that an "
+                             "earlier run extracted from the regular archives.")
     args = parser.parse_args(argv)
 
     rars = layout.rars_dir(args.data_dir)
@@ -479,8 +515,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"No .rar archives found in {rars}", file=sys.stderr)
         return 1
 
-    regular_archives = [a for a in all_archives if not is_missing_segments(a)]
-    missing_archives = [a for a in all_archives if is_missing_segments(a)]
+    regular_archives = [a for a in all_archives if not is_patch_archive(a)]
+    patch_archives = [a for a in all_archives if is_patch_archive(a)]
 
     binary, kind = find_extractor()
     print(f"Using extractor: {binary} ({kind})")
@@ -489,16 +525,25 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Regular archives ({len(regular_archives)}):")
         for a in regular_archives:
             print(f"    {a.name}  ({a.stat().st_size / 1e9:.2f} GB)")
-    if missing_archives:
-        print(f"  Missing-segments archives ({len(missing_archives)}):")
-        for a in missing_archives:
+    if patch_archives:
+        print(f"  Patch archives ({len(patch_archives)}):")
+        for a in patch_archives:
             print(f"    {a.name}  ({a.stat().st_size / 1e9:.2f} GB)")
 
-    print(f"Indexing {len(regular_archives)} regular archive(s)...")
-    archive_entries: dict[Path, list[tuple[str, int, str | None]]] = {}
-    for a in regular_archives:
-        archive_entries[a] = list_entries(binary, kind, a)
-        print(f"  {a.name}: {len(archive_entries[a])} entries")
+    if args.patches_only:
+        if not patch_archives:
+            print(f"No patch archives found in {rars}", file=sys.stderr)
+            return 1
+        if not (out.is_dir() and any(out.iterdir())):
+            print(f"--patches-only needs the extracted images, but {out} is empty or "
+                  f"missing.", file=sys.stderr)
+            return 1
+        print("Skipping the regular archives (--patches-only).")
+        regular_archives = []
+
+    if regular_archives:
+        print(f"Indexing {len(regular_archives)} regular archive(s)...")
+    archive_entries = _index_archives(binary, kind, regular_archives)
 
     dup_out = layout.images_duplicates_dir(args.data_dir)
 
@@ -536,10 +581,10 @@ def main(argv: list[str] | None = None) -> int:
         print("Flattening splitN/ wrappers...")
         _flatten_split_wrappers(out)
 
-    if missing_archives:
-        _apply_missing_segments(binary, kind, missing_archives, out,
-                                layout.missing_segments_tmp_dir(args.data_dir),
-                                jobs=args.jobs)
+    if patch_archives:
+        _apply_patch_archives(binary, kind, patch_archives, out,
+                              layout.patch_archives_tmp_dir(args.data_dir),
+                              jobs=args.jobs)
 
     print(f"\nDone. {sum(1 for p in out.rglob('*') if p.is_file())} file(s) in {out}")
     return 0

@@ -1,0 +1,10 @@
+# The configuration of a public server behind Caddy (see ../README.md#public-deployment).
+# Install as /srv/irap-eval/server.toml and set the dataset directories.
+data_dir = "data"
+host = "127.0.0.1"   # only Caddy connects
+port = 8600
+is_served_over_https = true
+
+[datasets.vietnam]
+dataset_dir = "/data/IRAP_Vietnam"
+analysis_splits = ["train", "val"]

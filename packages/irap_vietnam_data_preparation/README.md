@@ -1,152 +1,124 @@
-# IRAP-Vietnam data preparation
+# iRAP-Vietnam data preparation
 
-End-to-end pipeline for turning the raw images and Excel tables into an IRAP-BH-compatible dataset.
+Scripts that turn the Vietnam panoramic images and Excel coding tables into a dataset compatible with the iRAP-BH format. [`vietnam_data_preparation.md`](vietnam_data_preparation.md) gives the reasons for the design decisions.
 
-For the rationale and decisions behind each step see [`vietnam_data_preparation.md`](vietnam_data_preparation.md).
+## Requirements
 
-## Prerequisites
+- `unrar` (preferred) or `7z` on `PATH`.
+- Python packages: `pandas openpyxl xlrd pyarrow tqdm numpy`. The split editor also needs `streamlit>=1.52 plotly`, and the cross-annotator evaluation needs `scikit-learn`.
+- A dataset root directory, `<data_dir>`. Put `coding-tables.zip` (or an unzipped `coding-tables/` directory) and `attribute_metadata.json` from the [releases](https://github.com/Ivan1248/irap-tools/releases) in `<data_dir>/_raw/`.
 
-- `unrar` (preferred) or `7z` on `PATH` for image extraction.
-- Python packages: `uv pip install pandas openpyxl xlrd pyarrow tqdm numpy`. The Streamlit-based split editor additionally needs `streamlit>=1.35 plotly`, and the optional cross-annotator evaluation needs `scikit-learn`.
-- The `IRAP_Vietnam/` dataset root, with `_raw/` populated (see "Layout" below).
-
-## Layout
-
-Every per-stage script takes a single positional `<data_dir>` argument – the path to
-the dataset root – and derives all subpaths internally.
+## Directory layout
 
 ```
-<data_dir>/                      # IRAP_Vietnam dataset root
-  _raw/                          # populated manually + Stage 1
-    coding-tables.zip            # (or unzipped coding-tables/ directory)
+<data_dir>/
+  _raw/                                  # inputs
+    coding-tables.zip
     attribute_metadata.json
-    image_rars/                  # Stage 1 output (downloaded RAR archives)
-  
-  _work/                         # intermediate outputs, can be deleted after
-    rows.parquet
-    parse_report.json
-    build_report.json
-  
-  FRAMES/                        # Stage 2 output (nested by video sequence)
-    <video_dir>/
-      <video_dir>_seg<N>.png
-  segment_id_to_data_paths_rel.json  # Stage 3b outputs (directly in root)
+    image_rars/                          # step 1
+  _work/                                 # intermediate files and reports, deletable
+    rows.parquet, parse_report.json      # step 3
+    cross_annotator_report.json          # step 3, optional
+    build_report.json                    # step 4
+    repeated_images_report.json          # step 4, optional
+    FRAMES_duplicates/                   # step 2, if archives share a path
+  FRAMES/<video_dir>/<video_dir>_seg<N>.png   # step 2
+  segment_id_to_data_paths_rel.json      # step 4
   segment_id_to_road_data.json
   road_id_to_segment_id_sequence.json
-  attribute_metadata.json        # copy of _raw/attribute_metadata.json
-  splits.json                    # Stage 3c
+  attribute_metadata.json
+  unlabeled_segment_ids.json
+  unlabeled_sequence_id_to_data.json
+  unlabeled_unlocated_segment_ids.json
+  splits.json                            # step 5
 ```
 
-`coding-tables.zip` contains the iRAP coding tables – Excel spreadsheets of
-per-segment attribute annotations, where "coding" is iRAP's term for assigning
-attribute codes to 20-m road segments. Before running anything, populate
-`<data_dir>/_raw/` with at least `coding-tables.zip` (or an unzipped
-`coding-tables/` directory) and `attribute_metadata.json`. Stage 1 fills
-`<data_dir>/_raw/image_rars/`.
+## Steps
 
-`make_vietnam_data()` searches for `IRAP_Vietnam/` in this order: `$IRAP_HOME`,
-`$VIDLU_DATASETS`, `$VIDLU_DATA/datasets`, then ancestors of the package for
-`data/datasets/IRAP_Vietnam`.
+Run the scripts from this directory, with `DATA_DIR` set to the dataset root.
 
-## Per-stage commands
-
-Set `DATA_DIR=/path/to/IRAP_Vietnam`.
-
-### Stage 1 – Download images from Seafile
+### 1. Download the image archives
 
 ```bash
-python download_images.py $DATA_DIR
+python download_images.py $DATA_DIR $SHARE_URL
 ```
 
-Files are resumable (HTTP Range). Existing files with matching size are skipped. Total ≈ 110 GB across 7 `split*.rar` archives plus a small index.
+`SHARE_URL` is the Seafile public share link of the dataset (`https://host/d/<token>/`). Downloads about 110 GB of `split*.rar` archives from it. An interrupted download resumes, and a file whose size already matches is skipped.
 
-### Stage 2 – Extract images grouped by source video
+### 2. Extract the images
 
 ```bash
 python extract_images.py $DATA_DIR --ignore-duplicates
 ```
 
-- Extracts with `unrar x` / `7z x`. The outer `splitN/` wrapper is stripped, leaving `images/<video_dir>/<video_dir>_seg<N>.png`.
-- Checks for collisions across the `split*.rar` archives. Aborts on duplicates unless `--ignore-duplicates` is passed. All duplicate copies are extracted to `_work/images_duplicates/` for manual review.
-- If `images/` exists, prompts to wipe before extraction (use `--yes` to wipe without prompting).
-- `missing_segments*.rar` archives (corrected segments) are applied last: each `<video_dir>_seg<N>.png` in them replaces or adds `images/<video_dir>/<file>`. They are excluded from the collision check, and replaced vs. added counts are reported.
-- No incremental mode: re-running wipes `images/`, re-extracts everything, then re-applies the missing_segments archives.
+- Writes the images to `FRAMES/<video_dir>/`, without the `splitN/` directory that wraps them in the archives. If `FRAMES/` is not empty, it asks for confirmation before it deletes it (`--yes` skips the question).
+- Stops if two archives contain the same path, and writes all copies to `_work/FRAMES_duplicates/` for review. With `--ignore-duplicates`, it continues, keeps one copy of each path, and warns about the paths whose copies differ.
+- Applies the patch archives last: the archives whose name contains `missing_segments` or `new files`. Their images replace or add files in `FRAMES/`, and they are not part of the duplicate check. `--patches-only` applies only them to the existing `FRAMES/`, e.g. after an interrupted patch step.
 
-### Stage 3a – Parse coding tables
+### 3. Parse the coding tables
 
 ```bash
 python parse_coding_tables.py $DATA_DIR
 ```
 
-Auto-unzips `_raw/coding-tables.zip` if needed. Validates required column names
-against `_raw/attribute_metadata.json` (errors on missing columns). Drops rows
-with `Length != 0.02 km`, missing scalar fields, unparseable
-`Image Reference FPZ`, no genuine attribute value at all (non-coding/padding
-rows), unknown IRAP codes, or, when the optional `offset_distance_m` column is
-present – an FPZ-to-annotation distance greater than 8 m. Resolves duplicate
-`seg_id`s across files by keeping the row with the most genuinely-coded
-attribute cells, warning when the duplicates' attribute values disagree.
+A coding table is an Excel sheet with one row per 20 m segment, for example:
 
-Rows with *some* (but not all) attribute cells blank are **kept** by default,
-with the missing cells set to `-1` (`MISSING_ATTR_CODE`, analogous to an ignore
-label). The `parse_report.json` and stdout summary record which attributes are
-missing in how many kept rows, per file and overall. Pass
-`--drop-rows-missing-attributes` to drop any row with a blank attribute cell.
+| Section | Distance | Length | Latitude start | Longitude start | Image Reference FPZ | Comments | Carriageway | Number of lanes | … |
+|---|---|---|---|---|---|---|---|---|---|
+| VID_20241211_153327_00_024 | 0.00 | 0.02 | 10.372859 | 105.449173 | [seg. no. 1809249](…) | | 3 | 1 | … |
+| VID_20241211_153327_00_024 | 0.02 | 0.02 | 10.372734 | 105.449042 | [seg. no. 1809251](…) | | 3 | 1 | … |
 
-#### Optional – Cross-annotator evaluation
+- Distance and length are in km.
+- The `seg_id` in `Image Reference FPZ` identifies the image, e.g. `FRAMES/VID_20241211_153327_00_024/VID_20241211_153327_00_024_seg1809249.png`.
+- The images between two rows, e.g. `…_seg1809250.png`, have no row and become unlabeled segments.
+- The attribute columns, from `Carriageway` to just before `Additional comments`, hold iRAP codes. `attribute_metadata.json` maps the codes to values, e.g. `3` is an undivided road. The exceptions are `Speed limit` in km/h and `Intersecting road volume` as a number of vehicles, which the parser converts to codes. 30 km/h becomes the code of <30 km/h, as it has no code of its own. `incompatible_attributes.json` maps each iRAP-BH attribute name to its header where the two differ, e.g. `Carriageway label` to `Carriageway`.
 
-```bash
-python cross_annotator_eval.py $DATA_DIR
-```
+Writes one row per segment to `_work/rows.parquet` and a summary to `_work/parse_report.json`. The docstring of `parse_coding_tables.py` lists the rules for dropped rows. A duplicate `seg_id` keeps the row with the most coded attributes, and the first one in a tie. An attribute cell that is blank, not an integer, or without an iRAP code (e.g. an unknown code) becomes `-1`, which is an _ignore_ label. `--drop-rows-missing-attributes` drops such rows instead.
 
-### Stage 3b – Build BiH-compatible metadata
+Each cell set to `-1`, each interpreted value (e.g. a speed limit below 30 km/h, a duplicate dropped in a tie, or a duplicate with different codes) and each file-level irregularity (e.g. an ignored column with values) is an _issue_. The parser prints a warning per group of equal issues with their Excel row numbers to stderr, and a summary of the issues to stdout. `parse_report.json` lists the issues of each file, with their rows.
+
+Optional: `python cross_annotator_eval.py $DATA_DIR` measures the agreement between the coding tables that code the same segments. It writes `_work/cross_annotator_report.json`.
+
+### 4. Build the metadata
 
 ```bash
 python build_metadata.py $DATA_DIR
 ```
 
-Matches each parquet row to an image **by seg_id**, recursing into
-`<data_dir>/images/<video_dir>/`. Rows with no image are dropped. Mismatches
-between the coding-table `Section` cell and the image's `<video_dir>` name are
-recorded as `prefix_mismatch` (not dropped). Validates the section adjacency
-invariant (distance step ≈ 0.02 km between consecutive segments). The summary
-is written to `_work/build_report.json`.
+- **Excluded images:** leaves out images that do not show their segment, as if their files were missing, and drops the rows of their segments. It finds them by equal files (see `repeated_images.py`). An image folder with at least 3 equal images at its start or end (`MIN_NUM_FROZEN_IMAGES`) has a frozen frame there: the GNSS coordinates used to sample its frames are time-shifted, so all its images are offset from their labels, and the whole folder is left out. Of the other equal images, only the one with the lowest `seg_id` is kept. Each image left out is printed as a warning and listed in `_work/build_report.json` (`excluded_images`). Near-copies of frames, which are not equal files, stay in. After the excluded images change, open the split editor and save, so that `splits.json` drops their seg_ids.
+- **Matching:** matches each row to an image by `seg_id` and drops rows without an image. Images without a corresponding coding table row become unlabeled segments.
+- **Road sequences:** builds one road sequence per section. Adjacent labeled segments must be continuous: each `seg_id` step is 10 m of distance (± 2.5 m). A section with a gap is split into `<section>__part<N>` road sequences, so that context windows never span a gap.
+- **Unlabeled images:** an unlabeled image is placed into a road sequence if it lies between two adjacent labeled segments of the same recording. A recording is an image folder, or a run of consecutive `seg_id`s in a folder that holds several recordings (such as `FRAMES/nan/`). Each run of consecutive `seg_id`s of the other unlabeled images of a recording becomes an unlabeled road sequence `unlabeled:<recording>:<first seg_id>`, so every image has a road sequence for its context window. The unlabeled images of a recording without labeled segments have no map position and are marked as unlocated.
+- **Overlapping road sequences:** if two road sequences span the same unlabeled image, because both take labeled segments from the same stretch of a recording (two sections, or two parts of a split section), the image goes into both. The groups of such road sequences are printed and listed in `_work/build_report.json` (`shared_unlabeled_segments`), as the coding tables may need a correction.
 
-### Stage 3c – Assign train/val/test splits
+To check what a code change does to the metadata, copy the generated files to another directory before the rebuild, and compare the two builds:
 
-#### Output format
+```bash
+python compare_metadata.py <old_dir> $DATA_DIR
+```
 
-`split_editor.py` writes `splits.json` as `{<split_name>: [seg_id, ...]}` with segment ids as strings. Keys:
+Optional: `python find_repeated_images.py $DATA_DIR` finds the images with equal file content anywhere in the dataset. It lists the road sequences in which consecutive segments have equal images, with the number of repeated images and the runs of equal images, each with its position (the start, middle, end or whole of the road sequence), and the groups of equal images that are not consecutive segments of a road sequence. For each group and image folder, it also lists the span from the first to the last image of the group in seg_id order, with the number of other images in it and its position in the folder. A road sequence can end inside a run of equal images of a folder, and one different image splits a run, so the spans show, e.g., that a frozen frame fills the end of a folder. It reads only the files that have the same size as another file. It writes `_work/repeated_images_report.json`. It checks only the images of the metadata, which `build_metadata.py` builds without the equal images it leaves out, so it reports the equal images that remain.
 
-- `train`, `val`, `test` – labeled segments assigned to each split.
-- `unlabeled_train`, `unlabeled_val`, `unlabeled_test` – unlabeled segments assigned the same way. Omitted if `unlabeled_sequence_id_to_data.json` is not present in the metadata directory.
-- `unlabeled_unlocated` – unlabeled segments from image folders that have no labeled siblings, so no map coordinate is derivable. Auto-populated from `unlabeled_unlocated_segment_ids.json` and not user-editable in the map GUI. Omitted if the file is absent.
-
-#### Map GUI
+### 5. Assign the splits
 
 ```bash
 streamlit run split_editor.py -- $DATA_DIR
 ```
 
-Opens a browser-based map showing all road sections as coloured polylines.
+The editor shows the road sequences on a map, and the unlabeled recordings in muted colors. Pick a split in the sidebar and draw a rectangle: all sequences whose centroid is inside go to that split. **Save** writes `splits.json`. An existing `splits.json` is the starting assignment, so the editor can be opened again after a rebuild.
 
-1. Pick an active split in the sidebar (`train`, `val`, `test`, or `none`).
-2. **Draw a rectangle** on the map – all sections whose centroid falls inside are assigned to the active split.
-3. Use **Undo** to revert the last batch, **Reset** to clear all.
-4. **Save** writes `splits.json` (see *Output format* above).
+The sidebar shows the classes that each split misses, where a class is an (attribute, iRAP code) pair. Support is counted in road sequences, as the segments of one road are near-duplicates. *Fixable* classes occur in enough sequences to be in every split.
 
-##### Class coverage
+#### `splits.json` format
 
-The sidebar reports how well each split covers the attribute classes – a class being one (attribute, IRAP code) pair from `required_attributes` in `segment_id_to_road_data.json`. Cells left at `-1` (`MISSING_ATTR_CODE`) are an ignore label, so a never-coded attribute contributes no classes.
+`{<split>: [seg_id, ...]}`, with seg_ids as strings:
 
-Support is counted in **sequences**: a rare class seen in multiple segments of a single section is one example, not 300.
+- `train`, `val`, `test`: labeled segments.
+- `unlabeled_train`, `unlabeled_val`, `unlabeled_test`: unlabeled recordings, assigned in the editor.
+- `unlabeled_unlocated`: unlabeled recordings without a labeled segment, so without a map position. They are added automatically.
 
-Each split's row reads `N classes absent (M fixable)`:
-- **absent** – the split has no segment of the class.
-- **fixable** – of those, the ones occurring in at least `3 × n_min` sequences dataset-wide.
+### 6. Clean up
 
-Requires `streamlit >= 1.35`.
+After the dataset is verified, `_raw/` and `_work/` can be deleted.
 
-## Stage 4 – clean up
-
-After verifying the output, you can delete the `_raw/` and `_work/` directories.
+Re-running the pipeline needs no cleanup: each step overwrites its outputs, and the split editor starts from the existing `splits.json`.

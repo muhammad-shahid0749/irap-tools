@@ -1,13 +1,13 @@
 """Delete all pipeline outputs generated after the extraction step.
 
 Removes the files produced by ``parse_coding_tables.py``,
-``build_metadata.py`` and ``split_editor.py``, leaving the inputs to the
-extraction step (``_raw/``) and its outputs (``FRAMES/`` and
+``build_metadata.py``, ``find_repeated_images.py`` and
+``split_editor.py``, leaving the inputs to the extraction step
+(``_raw/``) and its outputs (``FRAMES/`` and
 ``_work/FRAMES_duplicates/``) intact.
 
 Usage:
-    python irap_vietnam_data_preparation/clean_generated.py <data_dir>
-                                                            [--dry-run] [--yes]
+    python clean_generated.py <data_dir> [--dry-run] [--yes]
 """
 
 import argparse
@@ -18,32 +18,30 @@ import layout
 
 
 def _targets(data_dir: Path) -> list[Path]:
-    metadata = layout.metadata_dir(data_dir)
-    work = layout.work_dir(data_dir)
     return [
         # parse_coding_tables.py
         layout.rows_path(data_dir),
         layout.parse_report_path(data_dir),
         # build_metadata.py
         layout.build_report_path(data_dir),
-        metadata / "segment_id_to_data_paths_rel.json",
-        metadata / "segment_id_to_road_data.json",
-        metadata / "road_id_to_segment_id_sequence.json",
-        metadata / layout.ATTR_META_FILENAME,
+        layout.segment_id_to_data_paths_rel_path(data_dir),
+        layout.segment_id_to_road_data_path(data_dir),
+        layout.road_id_to_segment_id_sequence_path(data_dir),
+        layout.output_attr_meta_path(data_dir),
         layout.unlabeled_segment_ids_path(data_dir),
         layout.unlabeled_sequence_id_to_data_path(data_dir),
         layout.unlabeled_unlocated_segment_ids_path(data_dir),
+        # find_repeated_images.py
+        layout.repeated_images_report_path(data_dir),
         # split_editor.py
-        metadata / "splits.json",
-        # _work/ itself if it ends up empty (FRAMES_duplicates may keep it alive)
-        work,
+        layout.splits_path(data_dir),
     ]
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("data_dir", type=Path,
-                        help="IRAP_Vietnam dataset root.")
+                        help="iRAP-Vietnam dataset root.")
     parser.add_argument("--dry-run", action="store_true",
                         help="List what would be removed without deleting.")
     parser.add_argument("--yes", action="store_true",
@@ -55,8 +53,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: {data_dir} is not a directory.", file=sys.stderr)
         return 1
 
-    candidates = _targets(data_dir)
-    existing_files = [p for p in candidates if p.is_file()]
+    existing_files = [p for p in _targets(data_dir) if p.is_file()]
+    # _work/ itself is removed if it ends up empty (FRAMES_duplicates may keep it alive).
     work = layout.work_dir(data_dir)
     work_empty_after = (
         work.is_dir()
@@ -64,14 +62,14 @@ def main(argv: list[str] | None = None) -> int:
                                                  if p.parent == work}
     )
 
-    if not existing_files and not (work.is_dir() and work_empty_after):
+    if not existing_files and not work_empty_after:
         print("Nothing to remove.")
         return 0
 
     print("The following will be removed:")
     for p in existing_files:
         print(f"  {p}")
-    if work.is_dir() and work_empty_after:
+    if work_empty_after:
         print(f"  {work}/  (empty after cleanup)")
 
     if args.dry_run:

@@ -1,10 +1,10 @@
 """Cross-annotator evaluation of per-attribute precision, recall and F1.
 
 Usage:
-    python irap_vietnam_data_preparation/cross_annotator_eval.py <data_dir>
+    python cross_annotator_eval.py <data_dir>
 
 Reads (under ``<data_dir>/_raw/``, exactly like parse_coding_tables.py):
-    coding-tables.zip                # OR an unzipped coding-tables/ directory
+    coding-tables.zip                # re-extracted into _work/coding-tables/
     attribute_metadata.json          # attribute_to_idx + value->irap mapping
 
 Writes (into ``<data_dir>/_work/``):
@@ -26,8 +26,7 @@ annotators (``--min-annotators``):
   excluded; a segment contributes to an attribute only where >= 2 annotators
   gave a genuine code for it.
 - Precision/recall/F1 are macro-averaged over the iRAP codes *present* in the
-  compared data (matching vidlu's ``only_present_classes=True`` convention),
-  treating one annotator as truth and the other as prediction.
+  compared data, treating one annotator as truth and the other as prediction.
 - ``pairs`` reports each *ordered* annotator pair A->B (truth=A, pred=B), where
   precision and recall are directional.
 - ``pooled`` aggregates all ordered pairs into one confusion matrix. Pooling
@@ -38,10 +37,11 @@ annotators (``--min-annotators``):
   the unordered annotation pairs (kappa is ``None`` when the codes show no
   variability, e.g. everyone agreed on one code).
 - ``conflicts`` lists the actual segments whose genuine codes disagree, naming
-  each annotator's source table and 1-based source row alongside its code.
+  each annotator's source table and Excel row number alongside its code.
 """
 
 import argparse
+import itertools
 import json
 import math
 import sys
@@ -55,24 +55,13 @@ from sklearn.metrics import cohen_kappa_score, precision_recall_fscore_support
 
 import layout
 from parse_coding_tables import (
-    MISSING_ATTR_CODE,
     ParseSetupError,
     collect_all_rows,
-    conflicting_attributes,
     format_row_ranges,
+    is_real_attribute_code,
     num_filled_attribute_cells,
     prepare_parse_inputs,
 )
-
-
-def _is_genuine(code: T.Any) -> bool:
-    """True if ``code`` is a real annotation (not blank/absent)."""
-    return code not in (None, MISSING_ATTR_CODE)
-
-
-def _clean_float(x: float | None) -> float | None:
-    """Map NaN/None to None so the JSON report stays valid (no NaN tokens)."""
-    return None if x is None or (isinstance(x, float) and math.isnan(x)) else x
 
 
 # -----------------------------------------------------------------------------
@@ -84,7 +73,7 @@ def macro_prf(y_true: T.Sequence[int], y_pred: T.Sequence[int]) -> dict[str, flo
     """Macro precision/recall/F1 over the codes present in ``y_true``/``y_pred``.
 
     Averaging only over present classes matches sklearn's ``average='macro'`` on
-    the present-label subset and vidlu's ``only_present_classes=True``.
+    the present-label subset.
     """
     labels = sorted(set(y_true) | set(y_pred))
     precision, recall, f1, _ = precision_recall_fscore_support(
@@ -103,7 +92,9 @@ def agreement_kappa(a: T.Sequence[int], b: T.Sequence[int]) -> dict[str, T.Any]:
     if n == 0:
         return {"pct_agreement": None, "cohen_kappa": None, "n": 0}
     pct = float(np.mean(np.asarray(a) == np.asarray(b)))
-    kappa = _clean_float(float(cohen_kappa_score(a, b)))
+    kappa = float(cohen_kappa_score(a, b))
+    # NaN (no variability) -> None so the JSON report stays valid.
+    kappa = None if math.isnan(kappa) else kappa
     return {"pct_agreement": pct, "cohen_kappa": kappa, "n": n}
 
 
@@ -138,20 +129,20 @@ def group_by_segment(
 def attribute_comparisons(
     shared: T.Mapping[str, dict[str, dict]],
     attr: str,
-) -> T.Iterator[tuple[str, dict[str, int]]]:
-    """Yield ``(seg_id, {source_file: code})`` of genuine codes for one attribute.
+) -> T.Iterator[dict[str, int]]:
+    """Yield ``{source_file: code}`` of genuine codes for one attribute, per segment.
 
     Only segments where >= 2 annotators gave a genuine code for ``attr`` are
     yielded.
     """
-    for seg_id, per_file in shared.items():
+    for per_file in shared.values():
         coded = {
             source_file: rec.get(attr)
             for source_file, rec in per_file.items()
-            if _is_genuine(rec.get(attr))
+            if is_real_attribute_code(rec.get(attr))
         }
         if len(coded) >= 2:
-            yield seg_id, coded
+            yield coded
 
 
 def compute_attribute_metrics(
@@ -167,22 +158,18 @@ def compute_attribute_metrics(
         lambda: ([], [])
     )
     n_segments = 0
-    for _seg_id, coded in attribute_comparisons(shared, attr):
+    for coded in attribute_comparisons(shared, attr):
         n_segments += 1
         files = sorted(coded)
-        for a in files:
-            for b in files:
-                if a == b:
-                    continue
-                pooled_true.append(coded[a])
-                pooled_pred.append(coded[b])
-                t, p = pair_ordered[(a, b)]
-                t.append(coded[a])
-                p.append(coded[b])
-        for i in range(len(files)):
-            for j in range(i + 1, len(files)):
-                unordered_a.append(coded[files[i]])
-                unordered_b.append(coded[files[j]])
+        for a, b in itertools.permutations(files, 2):
+            pooled_true.append(coded[a])
+            pooled_pred.append(coded[b])
+            t, p = pair_ordered[(a, b)]
+            t.append(coded[a])
+            p.append(coded[b])
+        for a, b in itertools.combinations(files, 2):
+            unordered_a.append(coded[a])
+            unordered_b.append(coded[b])
 
     if n_segments == 0:
         return None
@@ -194,6 +181,24 @@ def compute_attribute_metrics(
         for (a, b), (t, p) in sorted(pair_ordered.items())
     }
     return {"n_compared_segments": n_segments, "pooled": pooled, "pairs": pairs}
+
+
+def find_conflicting_attributes(
+    group: T.Sequence[dict],
+    attribute_names: T.Sequence[str],
+) -> dict[str, set[int]]:
+    """Finds the attributes whose genuine values disagree across a duplicate group.
+
+    Only genuinely-coded values (not ``None`` and not ``MISSING_ATTR_CODE``) are
+    compared. An attribute conflicts when the rows carry two or more distinct
+    such values. Returns ``{attr: {value, ...}}`` for the conflicting attributes.
+    """
+    conflicts: dict[str, set[int]] = {}
+    for attr in attribute_names:
+        values = {r.get(attr) for r in group if is_real_attribute_code(r.get(attr))}
+        if len(values) > 1:
+            conflicts[attr] = values
+    return conflicts
 
 
 def collect_conflicts(
@@ -212,7 +217,7 @@ def collect_conflicts(
     counts: Counter = Counter()
     for seg_id, per_file in shared.items():
         group = list(per_file.values())
-        for attr in conflicting_attributes(group, attribute_names):
+        for attr in find_conflicting_attributes(group, attribute_names):
             counts[attr] += 1
             if len(conflicts_per_attr[attr]) >= max_per_attribute:
                 continue
@@ -225,7 +230,7 @@ def collect_conflicts(
                 for rec in sorted(
                     group, key=lambda r: (r["source_file"], r["source_row"])
                 )
-                if _is_genuine(rec.get(attr))
+                if is_real_attribute_code(rec.get(attr))
             ]
             conflicts_per_attr[attr].append(
                 {"seg_id": seg_id, "annotations": annotations}
@@ -240,8 +245,7 @@ def shared_segment_ranges(
 
     Groups the shared segments by the exact set of annotators (source files)
     that coded them and collapses each group's seg_ids into continuous ranges
-    (the same ``format_row_ranges`` rendering parse_coding_tables uses for its
-    duplicate warnings). Returns one entry per annotator set, most segments
+    (``format_row_ranges``). Returns one entry per annotator set, most segments
     first.
     """
     by_set: dict[tuple[str, ...], list[int]] = defaultdict(list)
@@ -266,7 +270,7 @@ def shared_segment_ranges(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("data_dir", type=Path, help="IRAP_Vietnam dataset root.")
+    parser.add_argument("data_dir", type=Path, help="iRAP-Vietnam dataset root.")
     parser.add_argument(
         "--min-annotators", type=int, default=2,
         help="Only evaluate segments coded by at least this many annotators "

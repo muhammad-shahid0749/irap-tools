@@ -1,0 +1,2 @@
+podman build -t irap-eval-server -f packages/irap_evaluation_server/deployment/Containerfile .
+podman run --rm -it --init -p 127.0.0.1:8600:8600 -v ~/data/irap-eval:/irap-eval -v /mnt/sdb1/datasets:/datasets:ro irap-eval-server /irap-eval/server.toml

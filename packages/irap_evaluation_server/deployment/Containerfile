@@ -1,0 +1,14 @@
+# The evaluation server as a container image. Build it from the irap-tools checkout, whose
+# .containerignore leaves out all but the packages of the server:
+#   podman build -t irap-eval-server -f packages/irap_evaluation_server/deployment/Containerfile .
+# The configuration must have host = "0.0.0.0", since the port is published from the container.
+FROM docker.io/library/python:3.13-slim
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+WORKDIR /app
+COPY packages/irap_data packages/irap_data
+COPY packages/irap_evaluation packages/irap_evaluation
+COPY packages/irap_evaluation_server packages/irap_evaluation_server
+RUN uv pip install --system --no-cache -e packages/irap_data -e packages/irap_evaluation \
+    -e packages/irap_evaluation_server
+EXPOSE 8600
+ENTRYPOINT ["irap-eval-server"]

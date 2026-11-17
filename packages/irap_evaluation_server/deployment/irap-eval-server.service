@@ -1,0 +1,39 @@
+# The evaluation server as a systemd service, behind Caddy (see ../README.md#public-deployment).
+# Install as /etc/systemd/system/irap-eval-server.service.
+[Unit]
+Description=iRAP evaluation server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=irap-eval
+Group=irap-eval
+WorkingDirectory=/srv/irap-eval
+ExecStart=/srv/irap-eval/venv/bin/irap-eval-server /srv/irap-eval/server.toml
+Restart=on-failure
+# Read-only access to the system and the checkout. Only the data directory is writable.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/srv/irap-eval/data
+# New files are readable only by the service user, e.g. the cookie key and the accounts.
+UMask=0077
+# No access to devices, the kernel and other privileged parts of the system.
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

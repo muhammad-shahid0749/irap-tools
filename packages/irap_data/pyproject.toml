@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "irap-data"
+version = "0.3.0"
+description = "iRAP road-attribute dataset metadata, PyTorch datasets, a dataset viewer and a statistics report."
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+]
+
+[project.optional-dependencies]
+torch = ["torch", "torchvision", "tqdm", "pillow", "opencv-python"]
+viewer = ["irap-data[torch]", "streamlit"]
+report = ["matplotlib>=3.7"]
+test = ["pytest"]
+
+[project.scripts]
+irap-dataset-stats = "irap_data.tools.stats_cli:main"
+irap-dataset-viewer = "irap_data.tools.viewer:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

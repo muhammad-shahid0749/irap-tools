@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "irap-evaluation-server"
+version = "0.1.0"
+description = "A web app for archiving, scoring, comparing and analyzing saved iRAP model predictions"
+requires-python = ">=3.11"
+dependencies = [
+    "irap-data",
+    "irap-evaluation[xlsx]",
+    "nicegui>=3.17,<4",
+    "regex",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "openpyxl"]
+
+[project.scripts]
+irap-eval-server = "irap_evaluation_server.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"irap_evaluation_server.components" = ["*.css", "*.js"]
+
+[tool.uv.sources]
+irap-data = { path = "../irap_data", editable = true }
+irap-evaluation = { path = "../irap_evaluation", editable = true }

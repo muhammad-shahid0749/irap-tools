@@ -1,7 +1,12 @@
 *.pyc
 __pycache__/
 *.egg-info/
+build/
+dist/
 .pytest_cache/
+uv.lock
 
 input*
 output*
+todo.md
+.devdocs/context.md

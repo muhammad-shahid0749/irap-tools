@@ -1,21 +1,21 @@
 """Interactive map GUI for manually assigning sequences to train/val/test splits.
 
-Requires Streamlit >= 1.35 (for on_select="rerun").
+Requires Streamlit >= 1.52 (for ``width="stretch"`` of ``st.plotly_chart``).
 
 Launch:
-    streamlit run irap_vietnam_data_preparation/split_editor.py -- <data_dir>
+    streamlit run split_editor.py -- <data_dir>
 
-Reads ``<data_dir>/{segment_id_to_road_data,road_id_to_segment_id_sequence}.json``;
-writes ``<data_dir>/splits.json``.
+Reads the metadata files that build_metadata.py writes to ``<data_dir>``
+(:data:`METADATA_PATH_FUNCTIONS`) and writes ``<data_dir>/splits.json``.
 
 Interaction:
-    1. Pick an active split in the sidebar (Train / Val / Test / None).
+    1. Pick an active split in the sidebar (train / val / test / none).
     2. Draw a rectangle on the map – all sequences whose centroid falls
        inside are assigned to the active split.
-    3. Undo reverts the last assignment batch; Reset clears all.
-    4. Save writes splits.json (format documented in README.md, "Output format").
+    3. Undo reverts the last assignment batch. Reset clears all.
+    4. Save writes splits.json (format documented in README.md, "`splits.json` format").
 
-The sidebar reports class coverage per split: how many (attribute, IRAP code)
+The sidebar reports class coverage per split: how many (attribute, iRAP code)
 classes are absent, and how many fall short of a minimum number of *sequences*
 (not segments – consecutive segments of one road are near-duplicates). Classes
 too rare to appear in every split under any assignment are separated out, so
@@ -30,10 +30,11 @@ deterministically and reported in the sidebar rather than applied silently.
 """
 
 import argparse
+import dataclasses as dc
 import html
 import json
+import typing as T
 from collections import Counter, defaultdict
-from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -41,380 +42,403 @@ import plotly.graph_objects as go
 import streamlit as st
 
 import layout
+from parse_coding_tables import is_real_attribute_code
 
 
-# Colours (one per split label)
+# Splits ###########################################################################################
 
-SPLITS = ("train", "val", "test", "none")
-REAL_SPLITS = tuple(s for s in SPLITS if s != "none")
+REAL_SPLITS = ("train", "val", "test")
+UNASSIGNED = "none"
+SPLITS = (*REAL_SPLITS, UNASSIGNED)
+
+# Keys of splits.json other than the names of REAL_SPLITS.
+UNLABELED_SPLIT_PREFIX = "unlabeled_"
+UNLOCATED_SPLIT = "unlabeled_unlocated"
+
 COLORS: dict[str, str] = {
     "train": "#4477AA",
     "val": "#CC3333",
     "test": "#559933",
-    "none": "#BBBBBB",
+    UNASSIGNED: "#BBBBBB",
 }
-
-# Class-coverage settings. A "class" is one (attribute, IRAP code) pair.
-
-# Written by parse_coding_tables.py into cells that had no annotation; it is an
-# ignore label, not a class, so it never contributes to any count here.
-MISSING_ATTR_CODE = -1
-
-# Support is counted in distinct *sequences*, not segments: consecutive 20 m
-# segments of one road carry near-identical attributes, so 500 segments of a
-# rare class drawn from a single section are one example, not 500.
-DEFAULT_MIN_SEQ = 3
-
-# A class needs ``n_min`` sequences in each of the three splits, so unless it
-# occurs in at least this many sequences dataset-wide no assignment of whole
-# sequences can cover it everywhere. Such classes are reported separately rather
-# than counted against the current assignment, which would otherwise show a
-# floor that no amount of redrawing can bring down.
-STRATIFIABLE_FACTOR = len(REAL_SPLITS)
-
-COVERAGE_OK_COLOR = "#228833"
-COVERAGE_WARN_COLOR = "#CC5500"
 
 
 def _muted(hex_color: str, t: float = 0.5) -> str:
-    """Interpolate ``hex_color`` toward grey ``#BBBBBB`` by factor ``t``."""
-    r, g, b = int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16)
-    gr = 0xBB
-    r = round(r * (1 - t) + gr * t)
-    g = round(g * (1 - t) + gr * t)
-    b = round(b * (1 - t) + gr * t)
-    return f"#{r:02X}{g:02X}{b:02X}"
+    """Interpolates ``hex_color`` toward grey ``#BBBBBB`` by factor ``t``."""
+    grey = 0xBB
+    channels = (int(hex_color[i : i + 2], 16) for i in (1, 3, 5))
+    return "#" + "".join(f"{round(c * (1 - t) + grey * t):02X}" for c in channels)
 
 
 UNLABELED_COLORS: dict[str, str] = {s: _muted(c) for s, c in COLORS.items()}
 
-# Metadata files rewritten by build_metadata.py. Their (mtime, size) forms the
-# cache key of the loaders below, so re-running the build invalidates them.
-METADATA_FILENAMES: tuple[str, ...] = (
-    "segment_id_to_road_data.json",
-    "road_id_to_segment_id_sequence.json",
-    layout.UNLABELED_SEQUENCE_ID_TO_DATA_FILENAME,
-    layout.UNLABELED_UNLOCATED_SEGMENT_IDS_FILENAME,
-    layout.ATTR_META_FILENAME,
-)
+# Layer name -> sequence -> split. The editor replaces these dictionaries instead of changing them,
+# so the undo history can hold them without copies.
+Assignments = dict[str, dict[str, str]]
 
 
-@dataclass
+@dc.dataclass(frozen=True)
 class Layer:
     """A category of sequences (labeled or unlabeled) rendered as one centroid trace."""
 
     name: str  # "labeled" | "unlabeled"
-    data: dict[str, dict]
+    data: dict[str, dict]  # sequence -> {"segs": [seg_id, ...], "centroid": (lat, lon), ...}
     colors: dict[str, str]
     marker_size: int
-    key_prefix: str  # "" or "unlabeled_"
-    state_key: str  # st.session_state key holding sequence -> split
+    split_key_prefix: str
+
+    def split_key(self, split: str) -> str:
+        """Returns the splits.json key of the layer's sequences in ``split``."""
+        return f"{self.split_key_prefix}{split}"
 
 
-# CLI args (streamlit passes everything after "--" as sys.argv)
+# Class-coverage settings ##########################################################################
+
+# A "class" is one (attribute, iRAP code) pair.
+AttributeClass = tuple[str, int]
+
+# Support is counted in distinct *sequences*, not segments: consecutive 20 m
+# segments of one road carry near-identical attributes, so 500 segments of a
+# rare class drawn from a single section are one example, not 500.
+DEFAULT_MIN_NUM_SEQUENCES = 3
+MIN_NUM_SEQUENCES_KEY = "min_num_sequences"  # in st.session_state
+
+# A class needs the minimum number of sequences in each of the three splits, so
+# unless it occurs in at least this many times the minimum dataset-wide, no
+# assignment of whole sequences can cover it everywhere. Such classes are
+# reported separately rather than counted against the current assignment, which
+# would otherwise show a floor that no amount of redrawing can bring down.
+STRATIFIABLE_FACTOR = len(REAL_SPLITS)
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("data_dir", type=Path, help="IRAP_Vietnam dataset root.")
-    args = parser.parse_args()
-    args.metadata_dir = layout.metadata_dir(args.data_dir)
-    args.output = args.metadata_dir / "splits.json"
-    return args
+# Metadata loading #################################################################################
+
+# The files written by build_metadata.py that the editor reads.
+METADATA_PATH_FUNCTIONS = (
+    layout.segment_id_to_road_data_path,
+    layout.road_id_to_segment_id_sequence_path,
+    layout.unlabeled_sequence_id_to_data_path,
+    layout.unlabeled_unlocated_segment_ids_path,
+    layout.output_attr_meta_path,
+)
 
 
-# Data loading (cached so the large JSON is only read once per session)
+@dc.dataclass(frozen=True)
+class EditorMetadata:
+    sequence_data: dict[str, dict]  # see `load_sequence_data`
+    unlabeled_sequence_data: dict[str, dict]  # see `load_unlabeled_sequence_data`
+    # Without the seg_ids that are in a sequence. A stale
+    # unlabeled_unlocated_segment_ids.json – written by an earlier build and
+    # left behind by a later one that placed those image folders into real
+    # sequences – would otherwise put the same seg_id under both
+    # "unlabeled_<split>" and "unlabeled_unlocated" on save.
+    unlocated_seg_ids: list[str]
+    num_stale_unlocated_seg_ids: int
+    class_names: dict[AttributeClass, str]  # see `load_class_names`
 
 
-def _metadata_fingerprint(metadata_dir: Path) -> tuple:
-    """Return an (mtime, size) fingerprint of the build_metadata.py outputs.
+def _load_json(path: Path) -> T.Any:
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
-    ``st.cache_data`` keys on the argument values and caches process-wide, so
-    without this the loaders below would keep serving the metadata read at
-    server start even after ``build_metadata.py`` was re-run and the browser
-    refreshed – and a subsequent Save would write splits.json from obsolete
-    sequence membership.
+
+def compute_metadata_fingerprint(data_dir: Path) -> tuple:
+    """Returns the (name, mtime, size) of each file of :data:`METADATA_PATH_FUNCTIONS`.
+
+    It is the cache key of :func:`load_metadata` and of the assignments in the
+    session state, so that both are rebuilt after ``build_metadata.py`` was
+    re-run. Otherwise a Save would write splits.json from obsolete sequence
+    membership.
     """
     fingerprint = []
-    for name in METADATA_FILENAMES:
-        path = metadata_dir / name
+    for path_f in METADATA_PATH_FUNCTIONS:
+        path = path_f(data_dir)
         try:
             stat = path.stat()
         except OSError:
-            fingerprint.append((name, None, None))
+            fingerprint.append((path.name, None, None))
         else:
-            fingerprint.append((name, stat.st_mtime_ns, stat.st_size))
+            fingerprint.append((path.name, stat.st_mtime_ns, stat.st_size))
     return tuple(fingerprint)
 
 
-@st.cache_data
-def load_unlabeled_sequence_data(metadata_dir: str, fingerprint: tuple) -> dict[str, dict]:
-    """Return ``{sequence_id: {"segs": [seg_id, ...], "centroid": (lat, lon)}}``.
+def load_sequence_data(data_dir: Path) -> dict[str, dict]:
+    """Loads the labeled sequences.
 
-    ``fingerprint`` is unused; it is part of the cache key so that a rebuild of
-    the metadata invalidates this cache. Returns ``{}`` if the file does not
-    exist.
-    """
-    path = Path(metadata_dir) / layout.UNLABELED_SEQUENCE_ID_TO_DATA_FILENAME
-    if not path.exists():
-        return {}
-    with open(path, encoding="utf-8") as f:
-        raw = json.load(f)
-    return {
-        seq: {
-            "segs": list(entry["segs"]),
-            "centroid": (float(entry["centroid"][0]), float(entry["centroid"][1])),
+    Returns:
+        sequence -> {
+            "segs": [seg_id, ...],          # ordered
+            "coords": [(lat, lon), ...],    # parallel to segs
+            "centroid": (lat, lon),
+            "classes": {(attribute, code): num_segments, ...},
         }
-        for seq, entry in raw.items()
-    }
-
-
-@st.cache_data
-def load_unlocated_seg_ids(metadata_dir: str, fingerprint: tuple) -> list[str]:
-    """Return unlabeled seg_ids with no derivable map location.
-
-    These come from image folders that have no labeled siblings; they are
-    auto-assigned to the ``unlabeled_unlocated`` split. ``fingerprint`` is
-    unused; see :func:`load_unlabeled_sequence_data`. Returns ``[]`` if the file
-    does not exist.
-    """
-    path = Path(metadata_dir) / layout.UNLABELED_UNLOCATED_SEGMENT_IDS_FILENAME
-    if not path.exists():
-        return []
-    with open(path, encoding="utf-8") as f:
-        return [str(s) for s in json.load(f)]
-
-
-@st.cache_data
-def load_sequence_data(
-    metadata_dir: str,
-    fingerprint: tuple,
-) -> tuple[dict, dict]:
-    """Return (sequence_data, seg_to_sequence).
-
-    sequence_data[sequence] = {
-        "segs": [seg_id, ...],          # ordered
-        "coords": [(lat, lon), ...],    # parallel to segs
-        "centroid": (lat, lon),
-        "classes": {(attribute, code): n_segments, ...},
-    }
-    seg_to_sequence[seg_id] = sequence
 
     Sequences are the road_ids of ``road_id_to_segment_id_sequence.json``, *not*
     the ``section`` field of ``segment_id_to_road_data.json``: a section whose
     seg_id/distance adjacency is inconsistent is emitted as several
-    ``"<section>__partN"`` road_ids. ``seg_to_sequence`` is therefore built by
-    inverting ``sequence_data``, so it is the exact inverse of what the save
-    step writes.
+    ``"<section>__partN"`` road_ids. Only the seg_ids with road data are kept.
 
     ``classes`` is the sequence's histogram over the ``required_attributes``
-    already present in ``segment_id_to_road_data.json``, and is what the class
-    coverage report is summed from. :data:`MISSING_ATTR_CODE` and ``None`` are
-    excluded, so an attribute that was never coded contributes no classes at all
-    rather than a spurious "missing" one.
+    of its segments, and is what the class coverage report is summed from.
+    Non-genuine codes (``MISSING_ATTR_CODE`` and ``None``) are excluded, so an
+    attribute that was never coded contributes no classes at all rather than a
+    spurious "missing" one.
     """
-    base = Path(metadata_dir)
-    with open(base / "segment_id_to_road_data.json", encoding="utf-8") as f:
-        seg_to_road: dict = json.load(f)
-    with open(base / "road_id_to_segment_id_sequence.json", encoding="utf-8") as f:
-        road_to_segs: dict = json.load(f)
+    seg_to_road: dict = _load_json(layout.segment_id_to_road_data_path(data_dir))
+    road_to_segs: dict = _load_json(layout.road_id_to_segment_id_sequence_path(data_dir))
 
     sequence_data: dict = {}
     for seq, segs in road_to_segs.items():
-        coords = [(seg_to_road[sid]["lat"], seg_to_road[sid]["lon"]) for sid in segs if sid in seg_to_road]
-        if not coords:
+        kept = [s for s in segs if s in seg_to_road]
+        if not kept:
             continue
+        coords = [(seg_to_road[sid]["lat"], seg_to_road[sid]["lon"]) for sid in kept]
         lats = [c[0] for c in coords]
         lons = [c[1] for c in coords]
-        kept = [s for s in segs if s in seg_to_road]
         classes: Counter = Counter()
         for sid in kept:
             for attr, code in seg_to_road[sid].get("required_attributes", {}).items():
-                if code is None or int(code) == MISSING_ATTR_CODE:
-                    continue
-                classes[(attr, int(code))] += 1
+                if is_real_attribute_code(code):
+                    classes[(attr, int(code))] += 1
         sequence_data[seq] = {
             "segs": kept,
             "coords": coords,
             "centroid": (float(np.median(lats)), float(np.median(lons))),
             "classes": dict(classes),
         }
-
-    seg_to_sequence = {sid: seq for seq, entry in sequence_data.items() for sid in entry["segs"]}
-
-    return sequence_data, seg_to_sequence
+    return sequence_data
 
 
-@st.cache_data
-def load_class_names(metadata_dir: str, fingerprint: tuple) -> dict[tuple[str, int], str]:
-    """Return ``{(attribute, code): "Attribute = Value"}`` for display.
+def load_unlabeled_sequence_data(data_dir: Path) -> dict[str, dict]:
+    """Loads the unlabeled sequences, ``{}`` without the file.
+
+    Returns:
+        sequence -> {"segs": [seg_id, ...], "centroid": (lat, lon)}
+    """
+    path = layout.unlabeled_sequence_id_to_data_path(data_dir)
+    if not path.exists():
+        return {}
+    return {
+        seq: {
+            "segs": list(entry["segs"]),
+            "centroid": (float(entry["centroid"][0]), float(entry["centroid"][1])),
+        }
+        for seq, entry in _load_json(path).items()
+    }
+
+
+def load_unlocated_seg_ids(data_dir: Path) -> list[str]:
+    """Loads the unlabeled seg_ids with no derivable map location, ``[]`` without the file.
+
+    These come from image folders that have no labeled siblings. They are
+    auto-assigned to the :data:`UNLOCATED_SPLIT` split.
+    """
+    path = layout.unlabeled_unlocated_segment_ids_path(data_dir)
+    if not path.exists():
+        return []
+    return [str(s) for s in _load_json(path)]
+
+
+def load_class_names(data_dir: Path) -> dict[AttributeClass, str]:
+    """Loads ``{(attribute, code): "Attribute = Value"}`` for display.
 
     Read from ``attribute_metadata.json``, which is only needed to name classes.
     It is absent from some older metadata directories, so a missing or malformed
     file degrades the coverage report to ``"Attribute = code N"`` rather than
     disabling it: the classes themselves come from the segment data.
-    ``fingerprint`` is unused; see :func:`load_unlabeled_sequence_data`.
     """
-    path = Path(metadata_dir) / layout.ATTR_META_FILENAME
+    path = layout.output_attr_meta_path(data_dir)
     if not path.exists():
         return {}
     try:
-        with open(path, encoding="utf-8") as f:
-            meta = json.load(f)
         return {
             (attr, int(code)): f"{attr} = {value}"
-            for attr, values in meta.get("attribute_value_to_irap_number", {}).items()
+            for attr, values in _load_json(path).get("attribute_value_to_irap_number", {}).items()
             for value, code in values.items()
         }
     except (ValueError, TypeError, AttributeError):
         return {}
 
 
-# Class coverage
+def invert_sequence_segments(sequence_data: dict[str, dict]) -> dict[str, str]:
+    """Returns seg_id -> sequence."""
+    return {seg_id: seq for seq, entry in sequence_data.items() for seg_id in entry["segs"]}
 
 
-@dataclass
+@st.cache_data
+def load_metadata(data_dir: Path, fingerprint: tuple) -> EditorMetadata:
+    """Loads the files of :data:`METADATA_PATH_FUNCTIONS`.
+
+    ``st.cache_data`` caches for the whole server process and keys on the
+    argument values. ``fingerprint`` (:func:`compute_metadata_fingerprint`) is
+    only a part of that key.
+    """
+    sequence_data = load_sequence_data(data_dir)
+    unlabeled_sequence_data = load_unlabeled_sequence_data(data_dir)
+    unlocated_seg_ids_in_file = load_unlocated_seg_ids(data_dir)
+    located_seg_ids = (invert_sequence_segments(sequence_data).keys()
+                       | invert_sequence_segments(unlabeled_sequence_data).keys())
+    unlocated_seg_ids = [s for s in unlocated_seg_ids_in_file if s not in located_seg_ids]
+    return EditorMetadata(
+        sequence_data=sequence_data,
+        unlabeled_sequence_data=unlabeled_sequence_data,
+        unlocated_seg_ids=unlocated_seg_ids,
+        num_stale_unlocated_seg_ids=len(unlocated_seg_ids_in_file) - len(unlocated_seg_ids),
+        class_names=load_class_names(data_dir),
+    )
+
+
+# Class coverage ###################################################################################
+
+
+@dc.dataclass(frozen=True)
 class ClassCoverage:
-    """Per-split support for every (attribute, IRAP code) class in the data.
+    """Per-split support for every (attribute, iRAP code) class in the data.
 
-    Support is measured in distinct sequences (see :data:`DEFAULT_MIN_SEQ`).
+    Support is measured in distinct sequences (see :data:`DEFAULT_MIN_NUM_SEQUENCES`).
     Classes are partitioned by whether the current assignment can be blamed for
     their shortfall:
 
     ``stratifiable``
-        occur in at least ``STRATIFIABLE_FACTOR * n_min`` sequences, so some
+        occur in at least ``min_num_sequences_to_stratify`` sequences, so some
         assignment covers them in every split. ``short`` lists those that the
         current one does not, and is the number worth acting on.
     ``irreducible``
-        too rare for that to be possible at this ``n_min``, whatever the split.
+        too rare for that to be possible at this ``min_num_sequences``, whatever
+        the split.
     """
 
-    n_min: int
-    global_seqs: dict[tuple[str, int], int]
-    global_segs: dict[tuple[str, int], int]
-    split_seqs: dict[str, Counter]
-    split_segs: dict[str, Counter]
-    stratifiable: set[tuple[str, int]]
-    absent: dict[str, list[tuple[str, int]]]
-    short: dict[str, list[tuple[int, int, tuple[str, int]]]]
-    irreducible: list[tuple[int, tuple[str, int]]]
-    tvd: dict[str, dict[str, float]]
+    min_num_sequences: int
+    class_to_num_sequences: dict[AttributeClass, int]  # dataset-wide
+    stratifiable: set[AttributeClass]
+    # Split -> the classes with no segment in the split.
+    absent: dict[str, set[AttributeClass]]
+    # Split -> (number of sequences, number of segments, class) of the stratifiable classes with
+    # fewer than `min_num_sequences` sequences in the split, worst first.
+    short: dict[str, list[tuple[int, int, AttributeClass]]]
+    # (dataset-wide number of sequences, class), most frequent first.
+    irreducible: list[tuple[int, AttributeClass]]
+    # Split -> the largest per-attribute total variation distance between the class distributions
+    # (over segments) of the split and of the dataset, None for a split without segments.
+    max_tvd: dict[str, float | None]
 
     @property
-    def n_classes(self) -> int:
-        return len(self.global_seqs)
+    def min_num_sequences_to_stratify(self) -> int:
+        return STRATIFIABLE_FACTOR * self.min_num_sequences
 
-    def n_absent_fixable(self, split: str) -> int:
-        """Absent classes that some other assignment could have covered."""
-        return sum(1 for c in self.absent[split] if c in self.stratifiable)
+    @property
+    def num_classes(self) -> int:
+        return len(self.class_to_num_sequences)
 
-    def n_covered_everywhere(self) -> int:
-        """Stratifiable classes already at ``n_min`` sequences in every split."""
-        return sum(
-            1
-            for c in self.stratifiable
-            if all(self.split_seqs[s][c] >= self.n_min for s in REAL_SPLITS)
-        )
+    def num_absent_fixable(self, split: str) -> int:
+        """Returns the number of absent classes that another assignment could cover."""
+        return len(self.absent[split] & self.stratifiable)
 
-    def label(self, cls: tuple[str, int], names: dict[tuple[str, int], str]) -> str:
-        attr, code = cls
-        return names.get(cls, f"{attr} = code {code}")
+    @property
+    def num_covered_everywhere(self) -> int:
+        """The number of stratifiable classes that no split has too few sequences of."""
+        short_somewhere = {cls for entries in self.short.values() for _, _, cls in entries}
+        return len(self.stratifiable) - len(short_somewhere)
+
+
+def get_class_name(cls: AttributeClass, class_names: dict[AttributeClass, str]) -> str:
+    attr, code = cls
+    return class_names.get(cls, f"{attr} = code {code}")
 
 
 def compute_class_coverage(
     sequence_data: dict[str, dict],
-    assignments: dict[str, str],
-    n_min: int,
+    sequence_to_split: dict[str, str],
+    min_num_sequences: int,
 ) -> ClassCoverage:
-    """Summarise class support per split for the current assignment.
+    """Summarises the class support of each split under the assignment ``sequence_to_split``.
 
-    Runs on every rerun, i.e. after every box drawn, so it walks the
-    pre-aggregated per-sequence histograms rather than the segments themselves –
-    a few tens of thousands of increments, negligible next to the redraw.
+    It runs after every box drawn, so it sums the per-sequence histograms of
+    :func:`load_sequence_data` instead of visiting the segments.
     """
-    global_seqs: Counter = Counter()
-    global_segs: Counter = Counter()
-    split_seqs: dict[str, Counter] = {s: Counter() for s in SPLITS}
-    split_segs: dict[str, Counter] = {s: Counter() for s in SPLITS}
-
+    num_sequences: Counter = Counter()
+    num_segments: Counter = Counter()
+    split_num_sequences: dict[str, Counter] = {s: Counter() for s in SPLITS}
+    split_num_segments: dict[str, Counter] = {s: Counter() for s in SPLITS}
     for seq, entry in sequence_data.items():
-        split = assignments.get(seq, "none")
+        split = sequence_to_split[seq]
         for cls, n in entry["classes"].items():
-            global_seqs[cls] += 1
-            global_segs[cls] += n
-            split_seqs[split][cls] += 1
-            split_segs[split][cls] += n
+            num_sequences[cls] += 1
+            num_segments[cls] += n
+            split_num_sequences[split][cls] += 1
+            split_num_segments[split][cls] += n
 
-    stratifiable = {c for c, g in global_seqs.items() if g >= STRATIFIABLE_FACTOR * n_min}
+    stratifiable = {c for c, n in num_sequences.items()
+                    if n >= STRATIFIABLE_FACTOR * min_num_sequences}
 
-    absent: dict[str, list] = {}
+    absent: dict[str, set] = {}
     short: dict[str, list] = {}
     for split in REAL_SPLITS:
-        absent[split] = sorted(
-            (c for c in global_seqs if split_segs[split][c] == 0),
-            key=lambda c: (-global_seqs[c], c),
-        )
+        absent[split] = {c for c in num_sequences if split_num_sequences[split][c] == 0}
         # Worst first: no sequences at all before merely thin, and among equals
         # the classes with most to draw from, which are the easiest to fix.
         short[split] = sorted(
             (
-                (split_seqs[split][c], split_segs[split][c], c)
+                (split_num_sequences[split][c], split_num_segments[split][c], c)
                 for c in stratifiable
-                if split_seqs[split][c] < n_min
+                if split_num_sequences[split][c] < min_num_sequences
             ),
-            key=lambda t: (t[0], -global_seqs[t[2]], t[2]),
+            key=lambda t: (t[0], -num_sequences[t[2]], t[2]),
         )
 
     irreducible = sorted(
-        ((global_seqs[c], c) for c in global_seqs if c not in stratifiable),
+        ((n, c) for c, n in num_sequences.items() if c not in stratifiable),
         key=lambda t: (-t[0], t[1]),
     )
 
     # Distribution match: how far each split's class mix has drifted from the
     # dataset as a whole, per attribute. Total variation distance reads directly
     # as the fraction of probability mass sitting in the wrong class.
-    by_attr: dict[str, list] = defaultdict(list)
-    for cls in global_segs:
-        by_attr[cls[0]].append(cls)
-    tvd: dict[str, dict[str, float]] = {}
+    attr_to_classes: dict[str, list] = defaultdict(list)
+    for cls in num_segments:
+        attr_to_classes[cls[0]].append(cls)
+    max_tvd: dict[str, float | None] = {}
     for split in REAL_SPLITS:
-        per_attr: dict[str, float] = {}
-        for attr, classes in by_attr.items():
-            g_total = sum(global_segs[c] for c in classes)
-            s_total = sum(split_segs[split][c] for c in classes)
-            if not g_total or not s_total:
-                continue
-            per_attr[attr] = 0.5 * sum(
-                abs(split_segs[split][c] / s_total - global_segs[c] / g_total)
-                for c in classes
-            )
-        tvd[split] = per_attr
+        tvds = []
+        for classes in attr_to_classes.values():
+            total = sum(num_segments[c] for c in classes)
+            split_total = sum(split_num_segments[split][c] for c in classes)
+            if split_total:
+                tvds.append(0.5 * sum(
+                    abs(split_num_segments[split][c] / split_total - num_segments[c] / total)
+                    for c in classes
+                ))
+        max_tvd[split] = max(tvds, default=None)
 
     return ClassCoverage(
-        n_min=n_min,
-        global_seqs=dict(global_seqs),
-        global_segs=dict(global_segs),
-        split_seqs=split_seqs,
-        split_segs=split_segs,
+        min_num_sequences=min_num_sequences,
+        class_to_num_sequences=dict(num_sequences),
         stratifiable=stratifiable,
         absent=absent,
         short=short,
         irreducible=irreducible,
-        tvd=tvd,
+        max_tvd=max_tvd,
     )
 
 
-def _load_existing(
-    output_path: Path,
-    seg_to_sequence: dict[str, str],
-    key_prefix: str = "",
-) -> tuple[dict[str, str], int, int, dict[str, dict[str, int]]]:
-    """Return (sequence → split, num_unmatched_seg_ids, num_seg_ids, conflicts).
+# Assignments and splits.json ######################################################################
 
-    Only keys starting with ``key_prefix`` are read; the prefix is stripped
-    before validation against :data:`SPLITS`. Seg_ids that resolve to no known
-    sequence are counted rather than silently dropped, so a stale or mismatched
-    splits.json is visible instead of quietly resetting sequences to "none".
+
+@dc.dataclass(frozen=True)
+class SplitsAssignment:
+    """The assignment of sequences that the seg_ids of a splits.json give."""
+
+    sequence_to_split: dict[str, str]  # only the sequences with a seg_id in a split
+    num_seg_ids: int
+    num_unmatched_seg_ids: int  # seg_ids in no sequence
+    conflicts: dict[str, Counter]  # sequence -> split -> number of seg_ids, for > 1 split
+
+
+def assign_sequences_from_splits(
+    split_to_seg_ids: dict[str, list],
+    seg_id_to_sequence: dict[str, str],
+) -> SplitsAssignment:
+    """Assigns each sequence to the split that holds most of its seg_ids.
 
     splits.json stores seg_ids while the editor works per sequence, so one
     sequence can pick up seg_ids from several splits. That happens whenever a
@@ -422,94 +446,165 @@ def _load_existing(
     rows fix an adjacency violation and ``<section>__part0``/``__part1`` merge
     back into a single ``<section>``, each part carrying a different split.
     Such a sequence is resolved by majority of seg_ids (ties broken by
-    :data:`SPLITS` order) and reported in ``conflicts`` as
-    ``{sequence: {split: n_seg_ids}}``, rather than being decided silently by
-    whichever key happened to come last in the file.
+    :data:`SPLITS` order) and reported in ``conflicts``, rather than being
+    decided by whichever key comes last in the file.
 
-    Returns an empty mapping if the file does not exist.
+    Seg_ids that are in no sequence are counted rather than silently dropped, so
+    a stale or mismatched splits.json is visible instead of quietly resetting
+    sequences to :data:`UNASSIGNED`.
     """
-    if not output_path.exists():
-        return {}, 0, 0, {}
-    with open(output_path, encoding="utf-8") as f:
-        raw: dict = json.load(f)
-    votes: dict[str, dict[str, int]] = {}
-    n_total = 0
-    n_unmatched = 0
-    for key, seg_ids in raw.items():
-        if not key.startswith(key_prefix):
-            continue
-        split = key[len(key_prefix) :]
-        # Rejects the "unlabeled_*" keys when key_prefix is "" (they are not
-        # split names), and "unlabeled_unlocated" when it is "unlabeled_".
-        if not split or split not in SPLITS:
-            continue
-        for sid in seg_ids:
-            n_total += 1
-            seq = seg_to_sequence.get(str(sid))
-            if seq:
-                counts = votes.setdefault(seq, {})
-                counts[split] = counts.get(split, 0) + 1
+    votes: dict[str, Counter] = defaultdict(Counter)
+    num_seg_ids = 0
+    num_unmatched_seg_ids = 0
+    for split, seg_ids in split_to_seg_ids.items():
+        for seg_id in seg_ids:
+            num_seg_ids += 1
+            seq = seg_id_to_sequence.get(str(seg_id))
+            if seq is None:
+                num_unmatched_seg_ids += 1
             else:
-                n_unmatched += 1
-    result = {
-        seq: max(counts, key=lambda s: (counts[s], -SPLITS.index(s)))
-        for seq, counts in votes.items()
-    }
-    conflicts = {seq: counts for seq, counts in votes.items() if len(counts) > 1}
-    return result, n_unmatched, n_total, conflicts
+                votes[seq][split] += 1
+    return SplitsAssignment(
+        sequence_to_split={
+            seq: max(counts, key=lambda s: (counts[s], -SPLITS.index(s)))
+            for seq, counts in votes.items()
+        },
+        num_seg_ids=num_seg_ids,
+        num_unmatched_seg_ids=num_unmatched_seg_ids,
+        conflicts={seq: counts for seq, counts in votes.items() if len(counts) > 1},
+    )
 
 
-# Plotly figure
+def format_splits_warnings(layer_name: str, assignment: SplitsAssignment) -> list[str]:
+    """Describes how the splits.json that gave ``assignment`` differs from the metadata."""
+    warnings = []
+    if assignment.num_unmatched_seg_ids:
+        warnings.append(
+            f"{layout.SPLITS_FILENAME}: {assignment.num_unmatched_seg_ids} of "
+            f"{assignment.num_seg_ids} {layer_name} seg_ids matched no "
+            f"sequence and were dropped – the file predates the current metadata."
+        )
+    conflicts = assignment.conflicts
+    if conflicts:
+        max_num_shown = 5
+        shown = "; ".join(
+            f"{seq} → {assignment.sequence_to_split[seq]} "
+            f"({', '.join(f'{n}×{split}' for split, n in sorted(counts.items()))})"
+            for seq, counts in sorted(conflicts.items())[:max_num_shown]
+        )
+        more = (f"; and {len(conflicts) - max_num_shown} more"
+                if len(conflicts) > max_num_shown else "")
+        warnings.append(
+            f"{layout.SPLITS_FILENAME}: {len(conflicts)} {layer_name} sequence(s) carry seg_ids "
+            f"from more than one split, so a rebuild changed their membership. Resolved by "
+            f"majority of seg_ids: {shown}{more}. Re-check these on the map before saving."
+        )
+    return warnings
 
 
-def _data_bbox(sequence_data: dict) -> tuple[float, float, float, float] | None:
-    """Return (lat_min, lat_max, lon_min, lon_max) over all coords, or None."""
-    lats: list[float] = []
-    lons: list[float] = []
-    for s in sequence_data.values():
-        for lat, lon in s["coords"]:
-            lats.append(lat)
-            lons.append(lon)
-    if not lats:
-        return None
-    return min(lats), max(lats), min(lons), max(lons)
+def make_initial_assignments(
+    splits: dict[str, list],
+    layers: T.Sequence[Layer],
+) -> tuple[Assignments, list[str]]:
+    """Makes the starting assignments from the content of a splits.json, ``{}`` for no file.
+
+    Returns:
+        The assignments, with the sequences that ``splits`` does not assign in
+        :data:`UNASSIGNED`, and warnings (:func:`format_splits_warnings`).
+    """
+    assignments: Assignments = {}
+    warnings: list[str] = []
+    for layer in layers:
+        assignment = assign_sequences_from_splits(
+            {split: splits.get(layer.split_key(split), []) for split in REAL_SPLITS},
+            invert_sequence_segments(layer.data),
+        )
+        assignments[layer.name] = {
+            seq: assignment.sequence_to_split.get(seq, UNASSIGNED) for seq in layer.data
+        }
+        warnings += format_splits_warnings(layer.name, assignment)
+    return assignments, warnings
 
 
-def _centroid_trace(layer: Layer, assignments: dict[str, str]) -> go.Scattergeo:
-    """Build a single Scattergeo trace of all sequence centroids in ``layer``."""
+def make_splits(
+    layers: T.Sequence[Layer],
+    assignments: Assignments,
+    unlocated_seg_ids: list[str],
+) -> dict[str, list[str]]:
+    """Makes the content of splits.json (format documented in README.md, "`splits.json` format")."""
+    splits: dict[str, list[str]] = {split: [] for split in REAL_SPLITS}
+    for layer in layers:
+        for seq, split in assignments[layer.name].items():
+            if split != UNASSIGNED:
+                splits.setdefault(layer.split_key(split), []).extend(layer.data[seq]["segs"])
+    if unlocated_seg_ids:
+        splits[UNLOCATED_SPLIT] = list(unlocated_seg_ids)
+    return splits
+
+
+def assign_selected_sequences(
+    assignments: Assignments,
+    selected_points: list[dict],
+    split: str,
+) -> Assignments | None:
+    """Assigns the sequences of the selected centroids (see :func:`_centroid_trace`) to ``split``.
+
+    Returns:
+        The new assignments, or None if the selection changes nothing.
+    """
+    new_assignments = {name: dict(seq_to_split) for name, seq_to_split in assignments.items()}
+    selection_changes_assignments = False
+    for point in selected_points:
+        customdata = point.get("customdata")
+        if not customdata:
+            continue
+        seq, layer_name = customdata
+        seq_to_split = new_assignments.get(layer_name)
+        if seq_to_split is not None and seq in seq_to_split and seq_to_split[seq] != split:
+            seq_to_split[seq] = split
+            selection_changes_assignments = True
+    return new_assignments if selection_changes_assignments else None
+
+
+# Plotly figure ####################################################################################
+
+
+def _centroid_trace(layer: Layer, sequence_to_split: dict[str, str]) -> go.Scattergeo:
+    """Builds a single Scattergeo trace of all sequence centroids in ``layer``.
+
+    The ``customdata`` of a point is ``[sequence, layer name]``.
+    """
     sequences = list(layer.data)
-    lats = [layer.data[s]["centroid"][0] for s in sequences]
-    lons = [layer.data[s]["centroid"][1] for s in sequences]
-    colors = [layer.colors[assignments[s]] for s in sequences]
     tag = " (unlabeled)" if layer.name == "unlabeled" else ""
-    hover = [f"{s}{tag}<br>{len(layer.data[s]['segs'])} segs · {layer.key_prefix}{assignments[s]}" for s in sequences]
     return go.Scattergeo(
-        lat=lats,
-        lon=lons,
+        lat=[layer.data[s]["centroid"][0] for s in sequences],
+        lon=[layer.data[s]["centroid"][1] for s in sequences],
         mode="markers",
-        marker=dict(size=layer.marker_size, color=colors, symbol="circle"),
+        marker=dict(
+            size=layer.marker_size,
+            color=[layer.colors[sequence_to_split[s]] for s in sequences],
+        ),
         customdata=[[s, layer.name] for s in sequences],
-        text=hover,
+        text=[
+            f"{s}{tag}<br>{len(layer.data[s]['segs'])} segs · "
+            f"{layer.split_key(sequence_to_split[s])}"
+            for s in sequences
+        ],
         hovertemplate="%{text}<extra></extra>",
         name=f"{layer.name}_centroids",
         showlegend=False,
     )
 
 
-def _build_figure(
-    labeled: Layer,
-    labeled_assignments: dict[str, str],
-    unlabeled: Layer,
-    unlabeled_assignments: dict[str, str],
-) -> tuple[go.Figure, dict]:
+def _build_figure(labeled: Layer, unlabeled: Layer, assignments: Assignments) -> go.Figure:
     fig = go.Figure()
 
-    # Layer 1: road polylines – 4 aggregated traces (one per split)
+    # Layer 1: road polylines – one aggregated trace per split
     for split, color in COLORS.items():
         lats: list = []
         lons: list = []
-        for seq, sp in labeled_assignments.items():
-            if sp != split:
+        for seq, seq_split in assignments[labeled.name].items():
+            if seq_split != split:
                 continue
             coords = labeled.data[seq]["coords"]
             lats += [c[0] for c in coords] + [None]
@@ -528,12 +623,10 @@ def _build_figure(
 
     # Layer 2: unlabeled centroids (drawn under labeled so labeled stays on top)
     if unlabeled.data:
-        fig.add_trace(_centroid_trace(unlabeled, unlabeled_assignments))
+        fig.add_trace(_centroid_trace(unlabeled, assignments[unlabeled.name]))
 
-    # Layer 3: labeled centroids – used for box selection
-    fig.add_trace(_centroid_trace(labeled, labeled_assignments))
-
-    bbox = _data_bbox(labeled.data)
+    # Layer 3: labeled centroids
+    fig.add_trace(_centroid_trace(labeled, assignments[labeled.name]))
 
     fig.update_layout(
         margin=dict(l=0, r=0, t=0, b=0),
@@ -562,54 +655,93 @@ def _build_figure(
         height=700,
         uirevision="stable",  # preserve zoom/pan across reruns
     )
-    diag = {
-        "n_sequences": len(labeled.data),
-        "n_centroids": len(labeled.data),
-        "bbox": bbox,
+    return fig
+
+
+# Sidebar ##########################################################################################
+
+PAGE_CSS = """
+    <style>
+    :root {
+        --sidebar-text: var(--text-color);
+        --sidebar-text-muted: var(--text-color-muted);
+        --sidebar-text-dim: var(--text-color-disabled);
     }
-    return fig, diag
+    [data-testid="stSidebarHeader"] {
+        display: none;
+    }
+    [data-testid="stHeader"] {
+        display: none;
+    }
+    [data-testid="stAppViewContainer"] > .main {
+        top: 0;
+    }
+    [data-testid="stMainBlockContainer"] {
+        padding: 0rem;
+        max-width: 100%;
+        overflow: hidden;
+    }
+    .modebar-container {
+        top: 10px !important;
+    }
+    </style>
+    """
 
 
-def _sidebar_row(layer: Layer, assignments: dict[str, str], split: str, total_segs: int, indent: bool) -> str:
-    """Return the HTML for one sidebar metric row."""
-    color = layer.colors[split]
-    n = sum(len(layer.data[s]["segs"]) for s, sp in assignments.items() if sp == split)
-    pct = f" ({100 * n / total_segs:.1f}%)" if total_segs and split != "none" else ""
-    seqs = sum(1 for sp in assignments.values() if sp == split)
-    label = f"{layer.key_prefix}{split}"
-    if indent:
-        return (
-            f'<div style="margin:0 0 6px 0;font-size:0.85rem;color:var(--sidebar-text-muted);">'
-            f'<span style="background:{color};display:inline-block;width:10px;'
-            f'height:10px;border-radius:2px;margin-right:6px;vertical-align:middle;"></span>'
-            f"{label}: {n} segments{pct}, {seqs} sequences"
-            f"</div>"
-        )
+def _swatch_row(color: str, text: str, *, use_small_style: bool) -> str:
+    """Returns the HTML for one sidebar row: a colour swatch followed by ``text``."""
+    row_style, size_px, radius_px = (
+        ("margin:0 0 6px 0;font-size:0.85rem;color:var(--sidebar-text-muted);", 10, 2)
+        if use_small_style
+        else ("margin-bottom:2px;", 14, 3)
+    )
     return (
-        f'<div style="margin-bottom:2px;">'
-        f'<span style="background:{color};display:inline-block;width:14px;height:14px;'
-        f'border-radius:3px;margin-right:6px;vertical-align:middle;"></span>'
-        f"<strong>{label}</strong>: {n} segments{pct}, {seqs} sequences"
-        f"</div>"
+        f'<div style="{row_style}">'
+        f'<span style="background:{color};display:inline-block;width:{size_px}px;'
+        f'height:{size_px}px;border-radius:{radius_px}px;margin-right:6px;'
+        f'vertical-align:middle;"></span>'
+        f"{text}</div>"
+    )
+
+
+def _sidebar_row(
+    layer: Layer, sequence_to_split: dict[str, str], split: str, *, use_small_style: bool
+) -> str:
+    """Returns the HTML for the sidebar row with the size of ``split`` in ``layer``."""
+    num_segments = sum(
+        len(layer.data[seq]["segs"]) for seq, s in sequence_to_split.items() if s == split
+    )
+    num_sequences = sum(1 for s in sequence_to_split.values() if s == split)
+    total_num_segments = sum(len(entry["segs"]) for entry in layer.data.values())
+    pct = (f" ({100 * num_segments / total_num_segments:.1f}%)"
+           if total_num_segments and split != UNASSIGNED else "")
+    label = layer.split_key(split)
+    if not use_small_style:
+        label = f"<strong>{label}</strong>"
+    return _swatch_row(
+        layer.colors[split],
+        f"{label}: {num_segments} segments{pct}, {num_sequences} sequences",
+        use_small_style=use_small_style,
     )
 
 
 def _coverage_row_html(coverage: ClassCoverage, split: str) -> str:
-    """Return the HTML for the class-coverage line under a split's metric row.
+    """Returns the HTML for the class-coverage line under a split's sidebar row.
 
     Reports only how many classes have no segment at all in the split, and how
     many of those any assignment of whole sequences could have covered. The
-    shortfall against ``n_min`` sequences lives in the detail panel instead.
+    shortfall against the minimum number of sequences is in the detail panel.
 
     Colouring follows the fixable count, not the raw one: a split missing only
     classes that are too rare to place everywhere has nothing to act on, and
     flagging it would be a false alarm that never clears.
     """
-    n_absent = len(coverage.absent[split])
-    n_fixable = coverage.n_absent_fixable(split)
-    color = "var(--sidebar-text-dim)" if n_fixable else "var(--sidebar-text)"
-    noun = "class" if n_absent == 1 else "classes"
-    text = f"{n_absent} {noun} absent ({n_fixable} fixable)" if n_absent else "no class absent"
+    num_absent = len(coverage.absent[split])
+    num_fixable = coverage.num_absent_fixable(split)
+    color = "var(--sidebar-text-dim)" if num_fixable else "var(--sidebar-text)"
+    noun = "class" if num_absent == 1 else "classes"
+    text = (f"{num_absent} {noun} absent ({num_fixable} fixable)"
+            if num_absent else "no class absent")
     return (
         f'<div style="margin:0 0 6px 22px;font-size:0.8rem;color:{color};">'
         f"{text}"
@@ -617,13 +749,10 @@ def _coverage_row_html(coverage: ClassCoverage, split: str) -> str:
     )
 
 
-def _class_list_html(
-    entries: list[str],
-    limit: int = 12,
-) -> str:
-    """Return a compact, scannable list of class descriptions.
+def _class_list_html(entries: list[str], limit: int = 12) -> str:
+    """Returns a compact, scannable list of class descriptions.
 
-    Entries are escaped: IRAP value names routinely contain ``<`` and ``>``
+    Entries are escaped: iRAP value names routinely contain ``<`` and ``>``
     ("Grade = 0% to <2.5%", "Residential access <3"), which the sidebar would
     otherwise render as the start of a tag and swallow the rest of the line.
     """
@@ -641,18 +770,22 @@ def _class_list_html(
     )
 
 
-def _render_coverage_panel(coverage: ClassCoverage, names: dict[tuple[str, int], str]) -> None:
-    """Render the expandable class-coverage detail panel in the sidebar."""
-    n_ok = coverage.n_covered_everywhere()
-    n_strat = len(coverage.stratifiable)
-    with st.sidebar.expander(f"Class coverage — {n_ok}/{n_strat} classes in every split"):
+def _render_coverage_panel(
+    coverage: ClassCoverage, class_names: dict[AttributeClass, str]
+) -> None:
+    """Renders the expandable class-coverage detail panel in the sidebar."""
+    num_stratifiable = len(coverage.stratifiable)
+    with st.sidebar.expander(
+        f"Class coverage — {coverage.num_covered_everywhere}/{num_stratifiable} "
+        f"classes in every split"
+    ):
+        # The value is in the session state under the key already (see `main`).
         st.number_input(
             "Min sequences per class per split",
             min_value=1,
             max_value=20,
-            value=DEFAULT_MIN_SEQ,
             step=1,
-            key="class_n_min",
+            key=MIN_NUM_SEQUENCES_KEY,
             help=(
                 "Support is counted in distinct sequences, not segments: "
                 "consecutive segments of one road carry near-identical "
@@ -661,9 +794,9 @@ def _render_coverage_panel(coverage: ClassCoverage, names: dict[tuple[str, int],
             ),
         )
         st.caption(
-            f"{coverage.n_classes} (attribute, class) pairs occur in the data. "
-            f"{n_strat} of them appear in at least "
-            f"{STRATIFIABLE_FACTOR * coverage.n_min} sequences, so some assignment "
+            f"{coverage.num_classes} (attribute, class) pairs occur in the data. "
+            f"{num_stratifiable} of them appear in at least "
+            f"{coverage.min_num_sequences_to_stratify} sequences, so some assignment "
             f"covers them everywhere; the rest are listed at the bottom as "
             f"unfixable. TVD is the largest per-attribute total variation "
             f"distance from the dataset-wide class mix."
@@ -677,13 +810,13 @@ def _render_coverage_panel(coverage: ClassCoverage, names: dict[tuple[str, int],
         for split in REAL_SPLITS:
             # An unassigned split has no distribution to compare, and printing
             # 0.000 there would read as a perfect match rather than "no data".
-            worst_tvd = f"{max(coverage.tvd[split].values()):.3f}" if coverage.tvd[split] else "–"
+            max_tvd = coverage.max_tvd[split]
             rows += (
                 f'<tr><td style="color:{COLORS[split]};font-weight:600;">{split}</td>'
                 f"<td>{len(coverage.absent[split])}</td>"
-                f"<td>{coverage.n_absent_fixable(split)}</td>"
+                f"<td>{coverage.num_absent_fixable(split)}</td>"
                 f"<td>{len(coverage.short[split])}</td>"
-                f"<td>{worst_tvd}</td></tr>"
+                f"<td>{'–' if max_tvd is None else f'{max_tvd:.3f}'}</td></tr>"
             )
         st.markdown(
             f'<table style="font-size:0.78rem;width:100%;">{header}{rows}</table>',
@@ -692,9 +825,9 @@ def _render_coverage_panel(coverage: ClassCoverage, names: dict[tuple[str, int],
 
         for split in REAL_SPLITS:
             entries = [
-                f"{n_seq} seq / {n_seg} seg — {coverage.label(cls, names)} "
-                f"[{coverage.global_seqs[cls]} seq total]"
-                for n_seq, n_seg, cls in coverage.short[split]
+                f"{num_sequences} seq / {num_segments} seg — {get_class_name(cls, class_names)} "
+                f"[{coverage.class_to_num_sequences[cls]} seq total]"
+                for num_sequences, num_segments, cls in coverage.short[split]
             ]
             st.markdown(
                 f'<div style="margin:10px 0 4px 0;font-weight:600;color:{COLORS[split]};">'
@@ -706,7 +839,7 @@ def _render_coverage_panel(coverage: ClassCoverage, names: dict[tuple[str, int],
             else:
                 st.markdown(
                     f'<div style="font-size:0.75rem;color:var(--sidebar-text);">'
-                    f"every stratifiable class has ≥{coverage.n_min} sequences</div>",
+                    f"every stratifiable class has ≥{coverage.min_num_sequences} sequences</div>",
                     unsafe_allow_html=True,
                 )
 
@@ -715,64 +848,53 @@ def _render_coverage_panel(coverage: ClassCoverage, names: dict[tuple[str, int],
                 f'<div style="margin:12px 0 4px 0;font-weight:600;color:var(--sidebar-text);">'
                 f"{len(coverage.irreducible)} classes cannot be stratified</div>"
                 f'<div style="font-size:0.75rem;color:var(--sidebar-text-dim);margin-bottom:4px;">'
-                f"fewer than {STRATIFIABLE_FACTOR * coverage.n_min} sequences exist "
+                f"fewer than {coverage.min_num_sequences_to_stratify} sequences exist "
                 f"dataset-wide; no assignment covers these in every split</div>",
                 unsafe_allow_html=True,
             )
             st.markdown(
                 _class_list_html(
                     [
-                        f"{n} seq — {coverage.label(cls, names)}"
-                        for n, cls in coverage.irreducible
+                        f"{num_sequences} seq — {get_class_name(cls, class_names)}"
+                        for num_sequences, cls in coverage.irreducible
                     ]
                 ),
                 unsafe_allow_html=True,
             )
 
 
-# App
+# App ##############################################################################################
+
+
+def _parse_args() -> argparse.Namespace:
+    # Streamlit passes everything after "--" to the script.
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("data_dir", type=Path, help="iRAP-Vietnam dataset root.")
+    return parser.parse_args()
 
 
 def main() -> None:
     st.set_page_config(page_title="Split Editor", layout="wide")
-    args = _parse_args()
+    data_dir: Path = _parse_args().data_dir
+    splits_path = layout.splits_path(data_dir)
 
-    fingerprint = _metadata_fingerprint(args.metadata_dir)
-    sequence_data, seg_to_sequence = load_sequence_data(str(args.metadata_dir), fingerprint)
-    unlabeled_sequence_data: dict[str, dict] = load_unlabeled_sequence_data(
-        str(args.metadata_dir), fingerprint
-    )
-    unlocated_seg_ids: list[str] = load_unlocated_seg_ids(str(args.metadata_dir), fingerprint)
-    class_names = load_class_names(str(args.metadata_dir), fingerprint)
-
+    fingerprint = compute_metadata_fingerprint(data_dir)
+    metadata = load_metadata(data_dir, fingerprint)
     labeled = Layer(
         name="labeled",
-        data=sequence_data,
+        data=metadata.sequence_data,
         colors=COLORS,
         marker_size=8,
-        key_prefix="",
-        state_key="sequence_to_split",
+        split_key_prefix="",
     )
     unlabeled = Layer(
         name="unlabeled",
-        data=unlabeled_sequence_data,
+        data=metadata.unlabeled_sequence_data,
         colors=UNLABELED_COLORS,
         marker_size=6,
-        key_prefix="unlabeled_",
-        state_key="unlabeled_sequence_to_split",
+        split_key_prefix=UNLABELED_SPLIT_PREFIX,
     )
-    layers: tuple[Layer, ...] = (labeled, unlabeled)
-
-    # A stale unlabeled_unlocated_segment_ids.json – written by an earlier build
-    # and left behind by a later one that placed those image folders into real
-    # sequences – would otherwise be echoed back on save, putting the same
-    # seg_id under both "unlabeled_<split>" and "unlabeled_unlocated".
-    known_seg_ids = {
-        str(sid) for layer in layers for entry in layer.data.values() for sid in entry["segs"]
-    }
-    n_stale_unlocated = sum(1 for s in unlocated_seg_ids if s in known_seg_ids)
-    n_unlocated_on_disk = len(unlocated_seg_ids)
-    unlocated_seg_ids = [s for s in unlocated_seg_ids if s not in known_seg_ids]
+    layers = (labeled, unlabeled)
 
     # Session state init. Keyed on the metadata fingerprint rather than mere
     # presence, so that re-running build_metadata.py under a live session
@@ -780,127 +902,66 @@ def main() -> None:
     # no longer exist.
     if st.session_state.get("metadata_fingerprint") != fingerprint:
         st.session_state.metadata_fingerprint = fingerprint
-        u_seg_to_sequence = {str(sid): seq for seq, entry in unlabeled_sequence_data.items() for sid in entry["segs"]}
-        seg_lookup = {labeled.name: seg_to_sequence, unlabeled.name: u_seg_to_sequence}
-        warnings: list[str] = []
-        for layer in layers:
-            existing, n_unmatched, n_total, conflicts = _load_existing(
-                args.output, seg_lookup[layer.name], layer.key_prefix
-            )
-            st.session_state[layer.state_key] = {s: existing.get(s, "none") for s in layer.data}
-            if n_unmatched:
-                warnings.append(
-                    f"splits.json: {n_unmatched} of {n_total} {layer.name} seg_ids matched no "
-                    f"sequence and were dropped – the file predates the current metadata."
-                )
-            if conflicts:
-                shown = "; ".join(
-                    f"{seq} → {existing[seq]} "
-                    f"({', '.join(f'{n}×{sp}' for sp, n in sorted(counts.items()))})"
-                    for seq, counts in sorted(conflicts.items())[:5]
-                )
-                more = f"; and {len(conflicts) - 5} more" if len(conflicts) > 5 else ""
-                warnings.append(
-                    f"splits.json: {len(conflicts)} {layer.name} sequence(s) carry seg_ids from "
-                    f"more than one split, so a rebuild changed their membership. Resolved by "
-                    f"majority of seg_ids: {shown}{more}. Re-check these on the map before saving."
-                )
-        if n_stale_unlocated:
+        splits = _load_json(splits_path) if splits_path.exists() else {}
+        st.session_state.assignments, warnings = make_initial_assignments(splits, layers)
+        if metadata.num_stale_unlocated_seg_ids:
+            num_seg_ids_in_file = (len(metadata.unlocated_seg_ids)
+                                   + metadata.num_stale_unlocated_seg_ids)
             warnings.append(
                 f"{layout.UNLABELED_UNLOCATED_SEGMENT_IDS_FILENAME} is stale: "
-                f"{n_stale_unlocated} of its {n_unlocated_on_disk} seg_ids now belong to a real "
-                f"sequence. They are excluded from unlabeled_unlocated so no seg_id lands in two "
-                f"splits; re-run build_metadata.py to refresh the file."
+                f"{metadata.num_stale_unlocated_seg_ids} of its {num_seg_ids_in_file} seg_ids "
+                f"now belong to a real sequence. They are excluded from {UNLOCATED_SPLIT} so no "
+                f"seg_id lands in two splits; re-run build_metadata.py to refresh the file."
             )
         st.session_state.load_warnings = warnings
-        st.session_state.history: list[dict] = []
+        st.session_state.history = []  # earlier assignments, for Undo
+    st.session_state.setdefault("map_key_version", 0)
+    # Set before the coverage panel creates the widget with this key, as the
+    # rows above the panel need the value too.
+    st.session_state.setdefault(MIN_NUM_SEQUENCES_KEY, DEFAULT_MIN_NUM_SEQUENCES)
 
-    assignments = {layer.name: st.session_state[layer.state_key] for layer in layers}
+    assignments: Assignments = st.session_state.assignments
 
     # Sidebar
     st.sidebar.title("Split Editor")
 
-    for warning in st.session_state.get("load_warnings", []):
+    for warning in st.session_state.load_warnings:
         st.sidebar.warning(warning)
 
-    active_split = st.sidebar.radio(
-        "Active split (draw a box to assign)",
-        SPLITS,
-        horizontal=False,
+    active_split = st.sidebar.radio("Active split (draw a box to assign)", SPLITS)
+
+    st.sidebar.markdown(PAGE_CSS, unsafe_allow_html=True)
+
+    coverage = compute_class_coverage(
+        labeled.data, assignments[labeled.name], st.session_state[MIN_NUM_SEQUENCES_KEY]
     )
 
-    st.sidebar.markdown(
-        """
-        <style>
-        :root {
-            --sidebar-text: var(--text-color);
-            --sidebar-text-muted: var(--text-color-muted);
-            --sidebar-text-dim: var(--text-color-disabled);
-        }
-        [data-testid="stSidebarHeader"] {
-            display: none;
-        }
-        [data-testid="stHeader"] {
-            display: none;
-        }
-        [data-testid="stAppViewContainer"] > .main {
-            top: 0;
-        }
-        [data-testid="stMainBlockContainer"] {
-            padding: 0rem;
-            max-width: 100%;
-            overflow: hidden;
-        }
-        .modebar-container {
-            top: 10px !important;
-        }
-        [data-testid="stSidebar"] [data-testid="stMetricLabel"] p {
-            font-size: 0.8rem;
-        }
-        [data-testid="stSidebar"] [data-testid="stMetricValue"] {
-            font-size: 1.0rem;
-        }
-        [data-testid="stSidebar"] [data-testid="stMetricDelta"] {
-            font-size: 0.75rem;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    # Read before the widget that sets it is created further down: Streamlit
-    # reruns the whole script on a widget change, so session_state already holds
-    # the new value here and the rows below stay consistent with the panel.
-    n_min = int(st.session_state.get("class_n_min", DEFAULT_MIN_SEQ))
-    coverage = compute_class_coverage(labeled.data, assignments[labeled.name], n_min)
-
-    totals = {layer.name: sum(len(layer.data[s]["segs"]) for s in layer.data) for layer in layers}
     for split in SPLITS:
         st.sidebar.markdown(
-            _sidebar_row(labeled, assignments[labeled.name], split, totals[labeled.name], indent=False),
+            _sidebar_row(labeled, assignments[labeled.name], split, use_small_style=False),
             unsafe_allow_html=True,
         )
-        if split in REAL_SPLITS and coverage.n_classes:
+        if split in REAL_SPLITS and coverage.num_classes:
             st.sidebar.markdown(_coverage_row_html(coverage, split), unsafe_allow_html=True)
         if unlabeled.data:
             st.sidebar.markdown(
-                _sidebar_row(unlabeled, assignments[unlabeled.name], split, totals[unlabeled.name], indent=True),
+                _sidebar_row(unlabeled, assignments[unlabeled.name], split, use_small_style=True),
                 unsafe_allow_html=True,
             )
 
-    if unlocated_seg_ids:
-        unlocated_color = UNLABELED_COLORS["none"]
+    if metadata.unlocated_seg_ids:
         st.sidebar.markdown(
-            f'<div style="margin:0 0 6px 0;font-size:0.85rem;color:var(--sidebar-text-muted);">'
-            f'<span style="background:{unlocated_color};display:inline-block;width:10px;'
-            f'height:10px;border-radius:2px;margin-right:6px;vertical-align:middle;"></span>'
-            f"unlabeled_unlocated: {len(unlocated_seg_ids)} segments "
-            f"(auto-assigned on save)"
-            f"</div>",
+            _swatch_row(
+                UNLABELED_COLORS[UNASSIGNED],
+                f"{UNLOCATED_SPLIT}: {len(metadata.unlocated_seg_ids)} segments "
+                f"(auto-assigned on save)",
+                use_small_style=True,
+            ),
             unsafe_allow_html=True,
         )
 
-    if coverage.n_classes:
-        _render_coverage_panel(coverage, class_names)
+    if coverage.num_classes:
+        _render_coverage_panel(coverage, metadata.class_names)
 
     st.sidebar.markdown("---")
     col1, col2 = st.sidebar.columns(2)
@@ -908,56 +969,40 @@ def main() -> None:
     reset_clicked = col2.button("Reset", width="stretch")
 
     st.sidebar.markdown("")
-    save_clicked = st.sidebar.button("Save splits.json", width="stretch", type="primary")
-
-    def _snapshot() -> dict:
-        return {layer.name: dict(assignments[layer.name]) for layer in layers}
+    save_clicked = st.sidebar.button(
+        f"Save {layout.SPLITS_FILENAME}", width="stretch", type="primary"
+    )
 
     # Handle sidebar actions before rendering the map
     if undo_clicked and st.session_state.history:
-        snapshot = st.session_state.history.pop()
-        for layer in layers:
-            st.session_state[layer.state_key] = snapshot[layer.name]
+        st.session_state.assignments = st.session_state.history.pop()
         st.rerun()
 
     if reset_clicked:
-        st.session_state.history.append(_snapshot())
-        for layer in layers:
-            st.session_state[layer.state_key] = {s: "none" for s in layer.data}
+        st.session_state.history.append(assignments)
+        st.session_state.assignments = {
+            layer.name: dict.fromkeys(layer.data, UNASSIGNED) for layer in layers
+        }
         st.rerun()
 
     if save_clicked:
-        out: dict[str, list] = {s: [] for s in SPLITS if s != "none"}
-        for layer in layers:
-            for seq, sp in assignments[layer.name].items():
-                if sp == "none":
-                    continue
-                key = f"{layer.key_prefix}{sp}"
-                out.setdefault(key, []).extend(layer.data[seq]["segs"])
-        if unlocated_seg_ids:
-            out["unlabeled_unlocated"] = list(unlocated_seg_ids)
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(out, f, indent=2, ensure_ascii=False)
+        with open(splits_path, "w", encoding="utf-8") as f:
+            json.dump(make_splits(layers, assignments, metadata.unlocated_seg_ids), f,
+                      indent=2, ensure_ascii=False)
         # The file now matches the in-session state, so any load warning is stale.
         st.session_state.load_warnings = []
-        st.sidebar.success(f"Saved {args.output}")
+        st.sidebar.success(f"Saved {splits_path}")
 
     # Map
-    fig, diag = _build_figure(
-        labeled,
-        assignments[labeled.name],
-        unlabeled,
-        assignments[unlabeled.name],
-    )
     event = st.plotly_chart(
-        fig,
+        _build_figure(labeled, unlabeled, assignments),
+        key=f"map_{st.session_state.map_key_version}",
         on_select="rerun",
         width="stretch",
         config={
             "displayModeBar": True,
             "displaylogo": False,
             "scrollZoom": True,
-            "modeBarButtonsToRemove": [],
             "showTips": False,
             "responsive": True,
         },
@@ -965,21 +1010,19 @@ def main() -> None:
 
     # Handle map selection
     if event and event.selection and event.selection.points:
-        prev = _snapshot()
-        target_by_kind = {layer.name: assignments[layer.name] for layer in layers}
-        changed = False
-        for p in event.selection.points:
-            cd = p.get("customdata")
-            if not cd:
-                continue
-            seq, kind = cd[0], cd[1]
-            target = target_by_kind.get(kind)
-            if target is not None and seq in target and target[seq] != active_split:
-                target[seq] = active_split
-                changed = True
-        if changed:
-            st.session_state.history.append(prev)
-            st.rerun()
+        new_assignments = assign_selected_sequences(
+            assignments, event.selection.points, active_split
+        )
+        if new_assignments is not None:
+            st.session_state.history.append(assignments)
+            st.session_state.assignments = new_assignments
+        # Streamlit keeps a chart's selection for as long as the chart's identity
+        # (its key and figure) is unchanged. After a selection that changed
+        # nothing, it would therefore stay drawn and be replayed on the next
+        # rerun – into another split if that rerun came from the split radio.
+        # A new key discards it.
+        st.session_state.map_key_version += 1
+        st.rerun()
 
 
 if __name__ == "__main__":

@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "irap-evaluation"
+version = "0.1.0"
+description = "Saved iRAP model predictions: file format, evaluation, ensembling, reports and coding-table export"
+requires-python = ">=3.10"
+dependencies = [
+    "irap-data",
+    "numpy",
+    "pandas",
+    "pyarrow>=15",
+]
+
+[project.optional-dependencies]
+xlsx = ["xlsxwriter"]
+test = ["pytest", "openpyxl"]
+
+[project.scripts]
+irap-eval = "irap_evaluation.tools.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"irap_evaluation.reports" = ["data/*.json"]
+
+[tool.uv.sources]
+irap-data = { path = "../irap_data", editable = true }

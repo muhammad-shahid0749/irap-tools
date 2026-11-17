@@ -1,0 +1,3 @@
+[lint]
+# `dict(key=value)` calls are preferred over literals where they read better
+ignore = ["C408"]

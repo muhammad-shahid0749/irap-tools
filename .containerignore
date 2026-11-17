@@ -1,0 +1,11 @@
+# The build context of packages/irap_evaluation_server/deployment/Containerfile: only the packages
+# of the evaluation server, without local environments and caches.
+*
+!packages/irap_data
+!packages/irap_evaluation
+!packages/irap_evaluation_server
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/.ruff_cache
+**/*.egg-info

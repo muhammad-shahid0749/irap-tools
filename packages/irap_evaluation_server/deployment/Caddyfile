@@ -1,0 +1,29 @@
+# Caddy in front of the evaluation server (see ../README.md#public-deployment).
+# Install as /etc/caddy/Caddyfile, with the server's DNS name in place of eval.example.org. Caddy
+# gets and renews a Let's Encrypt certificate for the name.
+eval.example.org {
+	# Only uploads may be large: a .zip archive of all splits of a model can be several hundred
+	# MB, e.g. for Bosnia. The app refuses more than 1 GiB (`uploads.MAX_UPLOAD_NUM_BYTES`).
+	@upload path /api/uploads
+	request_body @upload {
+		max_size 1GiB
+	}
+	@not_upload not path /api/uploads
+	request_body @not_upload {
+		max_size 10MB
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "same-origin"
+		# No script-src, since NiceGUI needs inline scripts and eval.
+		Content-Security-Policy "frame-ancestors 'none'; form-action 'self'; base-uri 'none'; object-src 'none'"
+	}
+	# Also forwards the WebSocket connection of NiceGUI, and the Host header, which the app
+	# compares with the Origin header of POST requests. NiceGUI would trust a prefix sent by the
+	# client.
+	reverse_proxy 127.0.0.1:8600 {
+		header_up -X-Forwarded-Prefix
+	}
+}
